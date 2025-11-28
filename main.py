@@ -41,7 +41,13 @@ async def list_accounts_status(request: Request):
     token = request.headers.get("X-Admin-Token")
     if token != CONFIG.ADMIN_TOKEN:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    names = [f"account_{i:02d}" for i in range(1, 21)]
+    names_env = list(CONFIG.ACCOUNTS.keys())
+    if names_env:
+        names = names_env
+    else:
+        count = getattr(CONFIG, "ACCOUNT_COUNT", 20)
+        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+        names = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
     data = []
     for name in names:
         try:

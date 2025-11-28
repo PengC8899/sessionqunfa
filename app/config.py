@@ -39,6 +39,11 @@ class Settings:
             self.SEND_JITTER_PCT = 0.15
         self.GROUP_CACHE_TTL_SECONDS = int(os.getenv("GROUP_CACHE_TTL_SECONDS", "600"))
         self.GROUP_CACHE_ENABLED = int(os.getenv("GROUP_CACHE_ENABLED", "1"))
+        try:
+            self.ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "20"))
+        except Exception:
+            self.ACCOUNT_COUNT = 20
+        self.ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "account")
 
         accounts_list = (os.getenv("TG_ACCOUNTS") or "").strip()
         accounts: dict = {}
