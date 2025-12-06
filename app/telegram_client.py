@@ -41,7 +41,11 @@ class AccountClientManager:
         if self.client is None:
             session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
             self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+        # ensure a fresh connection
         await self.client.connect()
+        # if connection dropped, reconnect
+        if not self.client.is_connected():
+            await self.client.connect()
         try:
             resp = await self.client.send_code_request(phone, force_sms=force_sms)
             print(resp)
@@ -151,7 +155,7 @@ class MultiTelegramManager:
             # Dynamically create a manager for the account if it doesn't exist.
             # This assumes a standard naming convention for session files.
             session_name = account
-            api_id = CONFIG.TG_API_ID
+            api_id = int(CONFIG.TG_API_ID) if CONFIG.TG_API_ID is not None else None
             api_hash = CONFIG.TG_API_HASH
             if not api_id or not api_hash:
                 raise RuntimeError("TG_API_ID and TG_API_HASH must be configured in .env")
