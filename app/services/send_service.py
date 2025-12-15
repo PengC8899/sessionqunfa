@@ -45,14 +45,16 @@ async def send_to_groups(
     retry_max: int = 0,
     retry_delay_ms: int = 1500,
 ):
-    total = len(group_ids)
+    ids = list(group_ids)
+    random.shuffle(ids)
+    total = len(ids)
     success = 0
     failed = 0
     base_delay_ms = max(delay_ms, 0)
     min_delay_ms = max(getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500), 0)
     jitter_pct = max(0.0, min(getattr(CONFIG, "SEND_JITTER_PCT", 0.15), 0.5))
     base = max(base_delay_ms, min_delay_ms)
-    for idx, gid in enumerate(group_ids):
+    for idx, gid in enumerate(ids):
         skipped = _should_skip(account, gid, message, parse_mode, disable_web_page_preview)
         msg_id = None
         err = None

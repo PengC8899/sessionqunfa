@@ -38,6 +38,8 @@
           <button id="selectAll">全选</button>
           <button id="clearAll">取消全选</button>
           <button id="refreshGroups">刷新群列表</button>
+          <button id="clearCacheBtn">清除缓存</button>
+          <button id="debugGroups">诊断群列表</button>
         </div>
       </div>
       <div class="row" style="margin-top:8px;">
@@ -60,7 +62,15 @@
         </div>
         <div class="row">
           <label>每条间隔(ms)</label>
-          <input id="delayMs" type="number" value="60000" min="60000" step="1000" />
+          <input id="delayMs" type="number" value="60000" />
+        </div>
+        <div class="row">
+          <label>发送轮数</label>
+          <input id="rounds" type="number" value="30" min="1" step="1" />
+        </div>
+        <div class="row">
+          <label>每轮间隔(s)</label>
+          <input id="roundInterval" type="number" value="1200" min="0" step="60" />
         </div>
         <div class="row">
           <label><input id="disablePreview" type="checkbox" checked /> 关闭链接预览</label>
@@ -86,27 +96,33 @@
           <tbody id="logsBody"></tbody>
         </table>
       </div>
-      <div class="tasks" style="margin-top:16px;">
-        <h2>任务列表</h2>
+      <div class="global-summary" style="margin-top:16px;">
+        <h2>全局任务面板（每分钟刷新）</h2>
+        <div class="row" style="margin-bottom:8px; gap:8px; display:flex; align-items:center;">
+          <input id="summarySearch" type="text" placeholder="按账号筛选" style="width:200px;" />
+          <button id="summaryRefresh">刷新</button>
+          <span id="summaryLoading" style="margin-left:8px;"></span>
+          <span id="summaryUpdatedAt" style="margin-left:8px;"></span>
+        </div>
         <table>
           <thead>
             <tr>
-              <th>任务ID</th>
-              <th>账号</th>
-              <th>状态</th>
-              <th>进度</th>
-              <th>开始</th>
-              <th>结束</th>
-              <th>操作</th>
+              <th data-key="account" class="summarySort">账号</th>
+              <th data-key="tasks_count" class="summarySort">任务数</th>
+              <th data-key="total" class="summarySort">总群数</th>
+              <th data-key="success" class="summarySort">成功</th>
+              <th data-key="failed" class="summarySort">失败</th>
+              <th data-key="progress" class="summarySort">完成度</th>
+              <th data-key="rounds" class="summarySort">轮次</th>
+              <th data-key="last_updated_at" class="summarySort">更新时间</th>
             </tr>
           </thead>
-          <tbody id="tasksBody"></tbody>
+          <tbody id="globalSummaryBody"></tbody>
         </table>
-        <div id="taskDetail" style="margin-top:8px;"></div>
       </div>
     </section>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=1.1"></script>
 </body>
 </html>

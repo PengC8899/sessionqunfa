@@ -1,0 +1,46 @@
+# Python / App
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Telegram Sessions (SENSITIVE)
+sessions/
+*.session
+*.session-journal
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Security Keys (EXTREMELY SENSITIVE)
+*.pem
+*.key
+*.pub
+id_rsa
+id_rsa.pub
+
+# Docker / Deployment Archives
+*.tar.gz
+docker-compose.override.yml
+
+# Logs
+logs/
+*.log

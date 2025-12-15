@@ -2,6 +2,6 @@ http://localhost {
     reverse_proxy web:8000
 }
 
-7575.pro {
+http://7575.pro {
     reverse_proxy web:8000
 }

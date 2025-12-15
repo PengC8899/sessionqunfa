@@ -176,7 +176,7 @@ async function send(path) {
   const ids = getSelectedIds();
   const msg = document.getElementById('message').value;
   const parseMode = document.getElementById('parseMode').value;
-  const delayMs = parseInt(document.getElementById('delayMs').value || '600000');
+  const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
   if (!msg.trim()) { alert('消息不能为空'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }

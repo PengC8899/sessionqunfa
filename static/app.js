@@ -7,6 +7,10 @@ const state = {
   account: '',
   accounts: [],
   sending: false,
+  summary: [],
+  summaryFiltered: [],
+  summarySortKey: 'account',
+  summarySortAsc: true,
 };
 
 function loadToken() {
@@ -22,13 +26,14 @@ function saveToken() {
   localStorage.setItem('adminToken', t);
   const el = document.getElementById('tokenStatus');
   if (!t) {
-    if (el) { el.textContent = '请输入令牌'; el.style.color = '#d9534f'; }
+    if (el) { el.textContent = '请输入令牌'; el.className = 'status-error'; }
     alert('请输入令牌');
     return;
   }
-  if (el) { el.textContent = '令牌已保存'; el.style.color = '#28a745'; }
+  // Remove "pc-20251206-7575" legacy token check if needed, but for now just save what user typed
+  if (el) { el.textContent = '令牌已保存'; el.className = 'status-success'; }
   localStorage.setItem('tokenLocked', '1');
-  updateTokenLockUI();
+  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
 }
 
 function groupsCacheKey() {
@@ -60,7 +65,72 @@ function renderGroupsFromCacheIfAvailable() {
   }
 }
 
+function renderGlobalSummary() {
+  const tbody = document.getElementById('globalSummaryBody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  const rows = state.summaryFiltered.length ? state.summaryFiltered : state.summary;
+  rows.forEach(r => {
+    const total = Math.max(0, parseInt(r.total || 0));
+    const succ = Math.max(0, parseInt(r.success || 0));
+    const fail = Math.max(0, parseInt(r.failed || 0));
+    const pct = total > 0 ? Math.round((succ / total) * 100) : 0;
+    const barColor = pct >= 80 ? '#52c41a' : (pct >= 50 ? '#1890ff' : '#f5222d');
+    const progressBar = `<div style="width:100%; background:#f0f0f0; height:6px; border-radius:3px; overflow:hidden;"><div style="width:${pct}%; height:6px; background:${barColor}; transition:width 0.3s;"></div></div> <div style="font-size:11px; color:#888; text-align:right;">${pct}%</div>`;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.account}</td>
+      <td>${progressBar}</td>
+      <td class="status-success">${succ}</td>
+      <td class="status-error">${fail}</td>
+      <td>${(r.current_round||0)}/${(r.rounds||0)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function applySummaryFilter() {
+  const q = (document.getElementById('summarySearch')?.value || '').trim().toLowerCase();
+  if (!q) { state.summaryFiltered = []; renderGlobalSummary(); return; }
+  state.summaryFiltered = (state.summary || []).filter(x => (x.account || '').toLowerCase().includes(q));
+  renderGlobalSummary();
+}
+
+function sortSummary(key) {
+  const asc = (state.summarySortKey === key) ? !state.summarySortAsc : true;
+  state.summarySortKey = key; state.summarySortAsc = asc;
+  const arr = (state.summary || []).slice();
+  arr.sort((a,b) => {
+    const va = (key === 'progress') ? ((a.total||0) ? (a.success||0)/(a.total||0) : 0) : (a[key] || 0);
+    const vb = (key === 'progress') ? ((b.total||0) ? (b.success||0)/(b.total||0) : 0) : (b[key] || 0);
+    if (typeof va === 'string' || typeof vb === 'string') return asc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+    return asc ? (va - vb) : (vb - va);
+  });
+  state.summary = arr;
+  applySummaryFilter();
+}
+
+async function fetchGlobalSummary(force = false) {
+  const loadingEl = document.getElementById('summaryLoading');
+  if (loadingEl && force) loadingEl.classList.remove('d-none');
+  try {
+    const res = await fetchWithRetry('/api/tasks/summary', { headers: { 'X-Admin-Token': state.token } }, 3000, force ? 2 : 1);
+    if (!res.ok) { if (loadingEl) loadingEl.classList.add('d-none'); return; }
+    const data = await res.json();
+    state.summary = Array.isArray(data) ? data : [];
+    const upd = document.getElementById('summaryUpdatedAt');
+    if (upd) upd.textContent = '更新于 ' + new Date().toLocaleTimeString();
+    sortSummary(state.summarySortKey);
+    if (loadingEl) loadingEl.classList.add('d-none');
+  } catch (e) {
+    if (loadingEl) loadingEl.classList.add('d-none');
+  }
+}
+
 async function fetchGroups(forceRefresh = false) {
+  const loading = document.getElementById('groupCount');
+  if (loading) loading.textContent = '加载中...';
+  
   const onlyGroups = state.includeChannels ? 'false' : 'true';
   const acc = encodeURIComponent(state.account || '');
   const refresh = forceRefresh ? 'true' : 'false';
@@ -71,7 +141,7 @@ async function fetchGroups(forceRefresh = false) {
     try {
       const d = await res.json();
       if (res.status === 401) {
-        alert('令牌错误，请在顶部输入后点击“保存令牌”');
+        alert('令牌错误，请在顶部输入后点击“保存”');
       } else if (res.status === 403 && d.detail === 'session_not_authorized') {
         alert('账号未登录，请在上方登录管理中发送验证码并确认登录');
       } else {
@@ -80,6 +150,7 @@ async function fetchGroups(forceRefresh = false) {
     } catch {
       alert('群列表获取失败，请稍后重试');
     }
+    if (loading) loading.textContent = '加载失败';
     return;
   }
   const data = await res.json();
@@ -102,6 +173,17 @@ async function fetchGroups(forceRefresh = false) {
   state.filteredGroups = data;
   saveGroupsToCache(data);
   renderGroups();
+}
+
+// Separate function for token locking UI
+function updateTokenLockUI() {
+  const locked = (localStorage.getItem('tokenLocked') === '1');
+  const input = document.getElementById('adminToken');
+  const saveBtn = document.getElementById('saveToken');
+  const editBtn = document.getElementById('editToken');
+  if (input) input.disabled = locked;
+  if (saveBtn) saveBtn.classList.toggle('hidden', locked);
+  if (editBtn) editBtn.classList.toggle('hidden', !locked);
 }
 
 async function fetchAccounts() {
@@ -128,17 +210,22 @@ function renderGroups() {
   ul.innerHTML = '';
   state.filteredGroups.forEach(g => {
     const li = document.createElement('li');
+    li.className = 'group-item';
     const badge = g.is_channel ? '频道' : (g.is_megagroup ? '超级群' : '群');
     const checked = state.selectedIds.has(g.id) ? 'checked' : '';
     const disabled = (g.is_channel && !g.is_megagroup) ? 'disabled' : '';
     li.innerHTML = `
       <label>
         <input type="checkbox" class="groupCheck" value="${g.id}" ${checked} ${disabled} />
-        <span class="title">${g.title}</span>
-        ${g.member_count ? `<span class="count">(${g.member_count})</span>` : ''}
-        <span class="badge">${badge}</span>
-        ${g.username ? `<span class="uname">@${g.username}</span>` : ''}
-        ${disabled ? `<span class="warn">不可发送</span>` : ''}
+        <div class="group-info">
+          <div class="group-name">${g.title}</div>
+          <div class="group-meta">
+            <span>${g.member_count ? `${g.member_count}人` : ''}</span>
+            <span>${badge}</span>
+            ${g.username ? `<span>@${g.username}</span>` : ''}
+            ${disabled ? `<span style="color:var(--error)">不可发送</span>` : ''}
+          </div>
+        </div>
       </label>
     `;
     ul.appendChild(li);
@@ -179,7 +266,7 @@ async function send(path) {
   const resultEl = document.getElementById('result');
   if (resultEl) resultEl.textContent = '发送中...';
   if (!state.token) {
-    alert('请输入令牌并点击“保存令牌”');
+    alert('请输入令牌并点击“保存”');
     if (resultEl) resultEl.textContent = '未设置令牌';
     state.sending = false;
     if (sendBtn) sendBtn.disabled = false;
@@ -189,8 +276,8 @@ async function send(path) {
   const ids = getSelectedIds();
   const msg = document.getElementById('message').value;
   const parseMode = document.getElementById('parseMode').value;
-  const delayMs = parseInt(document.getElementById('delayMs').value || '1500');
-  const rounds = parseInt(document.getElementById('rounds')?.value || '1');
+  const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
+  const rounds = parseInt(document.getElementById('rounds')?.value || '30');
   const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
@@ -277,11 +364,10 @@ async function fetchLogs() {
   data.forEach(r => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${r.created_at || ''}</td>
+      <td style="color:var(--text-muted); font-size:12px;">${r.created_at || ''}</td>
       <td>${r.group_title || r.group_id}</td>
-      <td>${r.status}</td>
-      <td>${r.message_id || ''}</td>
-      <td>${r.error || ''}</td>
+      <td class="${r.status === 'success' ? 'status-success' : 'status-error'}">${r.status}</td>
+      <td style="font-size:12px;">${r.error || r.message_id || ''}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -289,13 +375,30 @@ async function fetchLogs() {
 
 function bindEvents() {
   document.getElementById('saveToken').addEventListener('click', () => { saveToken(); fetchAccounts(); fetchAuthStatus(); fetchGroups(true); fetchLogs(); });
+  
+  // Login Popover Toggle
+  const toggleLoginBtn = document.getElementById('toggleLogin');
+  const loginPopover = document.getElementById('loginPopover');
+  if (toggleLoginBtn && loginPopover) {
+    toggleLoginBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      loginPopover.classList.toggle('active');
+    });
+    document.addEventListener('click', (e) => {
+      if (!loginPopover.contains(e.target) && e.target !== toggleLoginBtn) {
+        loginPopover.classList.remove('active');
+      }
+    });
+    loginPopover.addEventListener('click', (e) => e.stopPropagation());
+  }
+
   const editTokenBtn = document.getElementById('editToken');
   if (editTokenBtn) {
     editTokenBtn.addEventListener('click', () => {
       localStorage.setItem('tokenLocked', '0');
-      updateTokenLockUI();
+      updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
       const el = document.getElementById('tokenStatus');
-      if (el) { el.textContent = '已解锁令牌'; el.style.color = '#17a2b8'; }
+      if (el) { el.textContent = '已解锁'; el.className = ''; }
     });
   }
   document.getElementById('searchInput').addEventListener('input', filterGroups);
@@ -306,10 +409,17 @@ function bindEvents() {
   if (clearBtn) {
     clearBtn.addEventListener('click', clearCache);
   }
-  const debugBtn = document.getElementById('debugGroups');
-  if (debugBtn) {
-    debugBtn.addEventListener('click', debugGroups);
+  const summaryRefresh = document.getElementById('summaryRefresh');
+  if (summaryRefresh) {
+    summaryRefresh.addEventListener('click', () => fetchGlobalSummary(true));
   }
+  const summarySearch = document.getElementById('summarySearch');
+  if (summarySearch) {
+    summarySearch.addEventListener('input', applySummaryFilter);
+  }
+  document.querySelectorAll('.summarySort').forEach(el => {
+    el.addEventListener('click', () => sortSummary(el.getAttribute('data-key')));
+  });
   document.getElementById('includeChannels').addEventListener('change', (e) => { state.includeChannels = e.target.checked; persistIncludeChannels(); fetchGroups(true); });
   const accountSel = document.getElementById('accountSelect');
   if (accountSel) {
@@ -340,7 +450,6 @@ function bindEvents() {
   const unlockBtn = document.getElementById('unlockAccount');
   if (unlockBtn) {
     unlockBtn.addEventListener('click', () => {
-      setAccountLocked(false);
       setLoginInputsVisible(true);
     });
   }
@@ -375,15 +484,18 @@ function restoreIncludeChannels() {
 
 window.addEventListener('DOMContentLoaded', async () => {
   loadToken();
-  updateTokenLockUI();
+  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
   restoreSelected();
   restoreIncludeChannels();
+  initAccountCheck();
   bindEvents();
   await fetchAccounts();
   await fetchAuthStatus();
   renderGroupsFromCacheIfAvailable();
   await fetchGroups();
   await fetchLogs();
+  await fetchGlobalSummary(true);
+  setInterval(fetchGlobalSummary, 60000);
 });
 
 function generateRequestId() {
@@ -419,9 +531,12 @@ async function fetchAuthStatus() {
   if (!res.ok) return;
   const data = await res.json();
   const el = document.getElementById('authStatus');
-  if (el) el.textContent = data.authorized ? '已授权' : '未授权';
-  const wasLocked = getAccountLocked();
-  if (data.authorized || wasLocked) {
+  if (el) {
+    el.textContent = data.authorized ? '已授权' : '未授权';
+    el.className = data.authorized ? 'status-success' : 'status-warning';
+  }
+  // Only hide login inputs if the specific account is authorized
+  if (data.authorized) {
     setAccountLocked(true);
     setLoginInputsVisible(false);
   } else {
@@ -431,7 +546,7 @@ async function fetchAuthStatus() {
 }
 
 async function clearCache() {
-  if (!state.token) { alert('请输入令牌并点击“保存令牌”'); return; }
+  if (!state.token) { alert('请输入令牌并点击“保存”'); return; }
   const acc = encodeURIComponent(state.account || '');
   const url = acc ? `/api/groups/cache/clear?account=${acc}` : '/api/groups/cache/clear';
   const res = await fetch(url, { headers: { 'X-Admin-Token': state.token } });
@@ -443,65 +558,68 @@ async function clearCache() {
   }
 }
 
-async function debugGroups() {
-  const acc = encodeURIComponent(state.account || '');
-  const onlyGroups = state.includeChannels ? 'false' : 'true';
-  const res = await fetch(`/api/groups/debug?only_groups=${onlyGroups}&account=${acc}`, { headers: { 'X-Admin-Token': state.token } });
-  const d = await res.json().catch(() => ({}));
-  const msg = `账号: ${d.account || ''}\n已授权: ${d.authorized ? '是' : '否'}\n会话: ${d.session_path || ''}\n总会话条目: ${d.dialogs_count || 0}\n采样返回: ${Array.isArray(d.sample) ? d.sample.length : 0}`;
-  alert(msg);
-}
-
 async function sendLoginCode() {
-  const phone = document.getElementById('loginPhone').value.trim();
-  const forceSms = document.getElementById('forceSms')?.checked || false;
-  if (!phone) { alert('请输入手机号'); return; }
-  const res = await fetch('/api/login/send-code', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
-    body: JSON.stringify({ account: state.account, phone, force_sms: forceSms })
-  });
-  if (res.ok) {
-    alert('验证码已发送');
-  } else if (res.status === 429) {
-    const d = await res.json();
-    alert(`发送频率过高，请在 ${d.retry_after || 60} 秒后重试`);
-  } else {
-    const d = await res.json().catch(() => ({}));
-    alert(`发送验证码失败：${d.detail || '未知错误'}`);
+  try {
+    const phone = document.getElementById('loginPhone').value.trim();
+    const forceSms = document.getElementById('forceSms')?.checked || false;
+    if (!phone) { alert('请输入手机号'); return; }
+    const res = await fetch('/api/login/send-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+      body: JSON.stringify({ account: state.account, phone, force_sms: forceSms })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      let msg = '验证码已发送';
+      if (data.type === 'app') msg += ' (已发送到Telegram App，请在手机/电脑客户端查看)';
+      else if (data.type === 'sms') msg += ' (已发送短信)';
+      else if (data.type === 'call') msg += ' (正在拨打电话)';
+      alert(msg);
+    } else if (res.status === 429) {
+      const d = await res.json();
+      alert(`发送频率过高，请在 ${d.retry_after || 60} 秒后重试`);
+    } else {
+      const d = await res.json().catch(() => ({}));
+      alert(`发送验证码失败：${d.detail || '未知错误'}`);
+    }
+  } catch (e) {
+    alert('发送请求出错: ' + e.message);
   }
 }
 
 async function submitLoginCode() {
-  const phone = document.getElementById('loginPhone').value.trim();
-  const code = document.getElementById('loginCode').value.trim();
-  const password = document.getElementById('loginPassword').value.trim();
-  if (!phone || !code) { alert('请输入手机号与验证码'); return; }
-  const res = await fetch('/api/login/submit-code', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
-    body: JSON.stringify({ account: state.account, phone, code, password })
-  });
-  if (res.ok) {
-    alert('登录成功');
-    await fetchAccounts(); // Refresh accounts to update the dropdown status
-    await fetchAuthStatus();
-    setAccountLocked(true);
-    setLoginInputsVisible(false);
-    await fetchGroups(true);
-  } else {
-    alert('登录失败');
+  try {
+    const phone = document.getElementById('loginPhone').value.trim();
+    const code = document.getElementById('loginCode').value.trim();
+    const password = document.getElementById('loginPassword').value.trim();
+    if (!phone || !code) { alert('请输入手机号与验证码'); return; }
+    const res = await fetch('/api/login/submit-code', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+      body: JSON.stringify({ account: state.account, phone, code, password })
+    });
+    if (res.ok) {
+      alert('登录成功');
+      await fetchAccounts(); 
+      await fetchAuthStatus();
+      setLoginInputsVisible(false);
+      await fetchGroups(true);
+    } else {
+      const d = await res.json().catch(() => ({}));
+      alert('登录失败: ' + (d.detail || '未知错误'));
+    }
+  } catch (e) {
+    alert('登录请求出错: ' + e.message);
   }
 }
 
-function updateTokenLockUI() {
-  const locked = (localStorage.getItem('tokenLocked') === '1');
-  const input = document.getElementById('adminToken');
-  const saveBtn = document.getElementById('saveToken');
-  const editBtn = document.getElementById('editToken');
-  if (input) input.disabled = locked;
-  if (saveBtn) saveBtn.disabled = locked;
-  if (editBtn) editBtn.style.display = locked ? 'inline-block' : 'none';
+/* Removed redundant updateTokenLockUI definition that was here */
+function setAccountLocked(locked) {
+  // Logic to lock account UI if needed - currently unused or can be removed
+}
+
+function getAccountLocked() {
+  return localStorage.getItem('tokenLocked') === '1';
 }
 
 function setLoginInputsVisible(visible) {
@@ -509,23 +627,203 @@ function setLoginInputsVisible(visible) {
   ids.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    // for label/checkbox forceSms, parent label holds id forceSms
     const node = el.tagName === 'INPUT' && el.type === 'checkbox' ? el.parentElement : el;
-    if (node) node.style.display = visible ? '' : 'none';
+    if (node) node.classList.toggle('hidden', !visible);
   });
   const unlockBtn = document.getElementById('unlockAccount');
-  if (unlockBtn) unlockBtn.style.display = visible ? 'none' : 'inline-block';
+  if (unlockBtn) unlockBtn.classList.toggle('hidden', visible);
+  
+  // Ensure inputs are enabled when visible
+  if (visible) {
+    ids.forEach(id => {
+       const el = document.getElementById(id);
+       if (el && el.tagName !== 'BUTTON') el.disabled = false;
+    });
+  }
 }
 
-function setAccountLocked(locked) {
-  const sel = document.getElementById('accountSelect');
-  if (sel) sel.disabled = locked;
-  try { localStorage.setItem('lockedAccount:' + (state.account || ''), locked ? '1' : '0'); } catch {}
+// --- Account Check Logic ---
+let isChecking = false;
+let checkAbortController = null;
+
+function initAccountCheck() {
+  const modal = document.getElementById('checkModal');
+  const btn = document.getElementById('checkAccountsBtn');
+  const close = document.getElementById('closeCheckModal');
+  const startBtn = document.getElementById('startCheckBtn');
+  const stopBtn = document.getElementById('stopCheckBtn');
+  const clearBtn = document.getElementById('clearInvalidBtn');
+  
+  if (!btn) return;
+  
+  btn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+  });
+  
+  close.addEventListener('click', () => {
+    if (isChecking) stopCheck();
+    modal.classList.add('hidden');
+  });
+  
+  startBtn.addEventListener('click', startCheck);
+  stopBtn.addEventListener('click', stopCheck);
+  clearBtn.addEventListener('click', clearInvalidAccounts);
 }
 
-function getAccountLocked() {
+function stopCheck() {
+  if (checkAbortController) {
+    checkAbortController.abort();
+    checkAbortController = null;
+  }
+  isChecking = false;
+  updateCheckUI(false);
+}
+
+async function startCheck() {
+  if (isChecking) return;
+  isChecking = true;
+  checkAbortController = new AbortController();
+  updateCheckUI(true);
+  
+  const accounts = state.accounts; 
+  const tbody = document.getElementById('checkResultsBody');
+  tbody.innerHTML = '';
+  
+  const results = [];
+  let processed = 0;
+  
+  document.getElementById('checkProgress').textContent = `0/${accounts.length}`;
+  
+  for (const acc of accounts) {
+    if (!isChecking) break;
+    
+    const tr = document.createElement('tr');
+    tr.id = `check-row-${acc}`;
+    tr.innerHTML = `
+      <td>${acc}</td>
+      <td><span class="status-warn">检查中...</span></td>
+      <td>-</td>
+      <td>-</td>
+    `;
+    tbody.appendChild(tr);
+    tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    
+    try {
+      const res = await fetch('/api/accounts/check-single', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+        body: JSON.stringify({ account: acc }),
+        signal: checkAbortController.signal
+      });
+      
+      const data = await res.json();
+      results.push(data);
+      updateRow(tr, data);
+      
+    } catch (e) {
+      if (e.name === 'AbortError') break;
+      updateRow(tr, { account: acc, valid: false, status: 'network_error', detail: e.message });
+    }
+    
+    processed++;
+    document.getElementById('checkProgress').textContent = `${processed}/${accounts.length}`;
+  }
+  
+  isChecking = false;
+  updateCheckUI(false);
+  
+  const hasInvalid = results.some(r => !r.valid && r.status !== 'missing_file');
+  const clearBtn = document.getElementById('clearInvalidBtn');
+  if (clearBtn) clearBtn.disabled = !hasInvalid;
+}
+
+function updateRow(tr, data) {
+  let statusHtml = '';
+  let detailHtml = '';
+  let actionHtml = '';
+  
+  if (data.valid) {
+    statusHtml = '<span class="status-ok">正常</span>';
+    detailHtml = `ID: ${data.id || '-'}<br>Phone: ${data.phone || '-'}`;
+  } else {
+    statusHtml = `<span class="status-error">${data.status}</span>`;
+    detailHtml = data.detail || '-';
+    if (data.status !== 'missing_file') {
+        actionHtml = `<button class="btn btn-danger btn-sm" onclick="deleteAccount('${data.account}')">删除</button>`;
+    }
+  }
+  
+  tr.innerHTML = `
+    <td>${data.account}</td>
+    <td>${statusHtml}</td>
+    <td style="font-size:0.75rem; color:var(--text-secondary);">${detailHtml}</td>
+    <td>${actionHtml}</td>
+  `;
+}
+
+function updateCheckUI(checking) {
+  const start = document.getElementById('startCheckBtn');
+  const stop = document.getElementById('stopCheckBtn');
+  if (checking) {
+    start.classList.add('hidden');
+    stop.classList.remove('hidden');
+  } else {
+    start.classList.remove('hidden');
+    stop.classList.add('hidden');
+  }
+}
+
+async function deleteAccount(account) {
+  if (!confirm(`确定要删除账号 ${account} 的登录信息吗？`)) return;
+  
   try {
-    const v = localStorage.getItem('lockedAccount:' + (state.account || ''));
-    return v === '1';
-  } catch { return false; }
+    const res = await fetch('/api/accounts/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+      body: JSON.stringify({ account })
+    });
+    const data = await res.json();
+    if (data.deleted) {
+      const tr = document.getElementById(`check-row-${account}`);
+      if (tr) tr.innerHTML = `<td>${account}</td><td class="status-warn">已删除</td><td>-</td><td>-</td>`;
+      // Update login UI if current account was deleted
+      if (state.account === account) {
+          fetchAuthStatus();
+      }
+    } else {
+      alert('删除失败');
+    }
+  } catch (e) {
+    alert('删除出错: ' + e.message);
+  }
+}
+
+window.deleteAccount = deleteAccount;
+
+async function clearInvalidAccounts() {
+  if (!confirm('确定要删除所有检测为失效/封禁的账号吗？此操作不可恢复！')) return;
+  
+  const rows = document.querySelectorAll('#checkResultsBody tr');
+  const tasks = [];
+  
+  for (const tr of rows) {
+    const acc = tr.cells[0].textContent;
+    if (tr.querySelector('button')) { 
+        tasks.push(
+            fetch('/api/accounts/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+                body: JSON.stringify({ account: acc })
+            }).then(res => res.json()).then(data => {
+                if (data.deleted) {
+                    tr.innerHTML = `<td>${acc}</td><td class="status-warn">已删除</td><td>-</td><td>-</td>`;
+                }
+            })
+        );
+    }
+  }
+  
+  await Promise.all(tasks);
+  alert('清理完成');
+  document.getElementById('clearInvalidBtn').disabled = true;
 }

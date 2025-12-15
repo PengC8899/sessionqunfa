@@ -12,10 +12,13 @@ from sqlalchemy.orm import Session
 from app.models import SendLog, Task, TaskEvent
 from app.services.send_service import send_to_groups
 from app.services.group_service import get_groups, clear_group_cache
+from app.routers.accounts import check_single_account, delete_account
 import json
 import time
 import uuid
 import asyncio
+import os
+import random
 from datetime import datetime, timedelta, timezone
 
 app = Starlette()
@@ -41,17 +44,23 @@ async def list_accounts_status(request: Request):
     token = request.headers.get("X-Admin-Token")
     if token != CONFIG.ADMIN_TOKEN:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    count = getattr(CONFIG, "ACCOUNT_COUNT", 20)
+    count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
     prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
     names = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
     data = []
+    
+    session_dir = CONFIG.SESSION_DIR
     for name in names:
-        try:
-            authorized = await multi_manager.is_authorized(name)
-        except Exception:
-            authorized = False
+        # Optimization: Check file existence instead of connecting to Telegram
+        # This is much faster for large number of accounts
+        session_path = os.path.join(session_dir, f"{name}.session")
+        authorized = os.path.exists(session_path)
+        # Always append the account, regardless of authorization status
         data.append({"account": name, "authorized": authorized})
     return JSONResponse(data)
+
+app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
+app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
 
 @app.route("/api/groups")
 async def list_groups(request: Request):
@@ -162,7 +171,7 @@ async def send(request: Request):
     message = (body.get("message") or "").strip()
     parse_mode = body.get("parse_mode") or "plain"
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
-    delay_ms = int(body.get("delay_ms", 1500))
+    delay_ms = int(body.get("delay_ms", 60000))
     retry_max = int(body.get("retry_max", getattr(CONFIG, "SEND_RETRY_MAX", 0)))
     retry_delay_ms = int(body.get("retry_delay_ms", getattr(CONFIG, "SEND_RETRY_DELAY_MS", 1500)))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
@@ -390,9 +399,9 @@ async def send_async(request: Request):
     message = (body.get("message") or "").strip()
     parse_mode = body.get("parse_mode") or "plain"
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
-    delay_ms = int(body.get("delay_ms", 1500))
+    delay_ms = int(body.get("delay_ms", 60000))
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = int(body.get("rounds", 1))
+    rounds = int(body.get("rounds", 30))
     round_interval_s = int(body.get("round_interval_s", 600))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
@@ -467,6 +476,39 @@ async def task_status(request: Request):
     finally:
         db.close()
 
+@app.route("/api/tasks/summary")
+async def tasks_summary(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    db: Session = SessionLocal()
+    try:
+        rows = db.query(Task).filter(Task.status == "running").all()
+        acc_map: dict[str, dict] = {}
+        for t in rows:
+            k = t.account_name
+            v = acc_map.get(k) or {"account": k, "tasks_count": 0, "total": 0, "success": 0, "failed": 0, "current_round": 0, "rounds": 0, "last_updated_at": None}
+            v["tasks_count"] += 1
+            v["total"] += int(t.total or 0)
+            v["success"] += int(t.success or 0)
+            v["failed"] += int(t.failed or 0)
+            v["current_round"] = max(int(v["current_round"] or 0), int(t.current_round or 0))
+            v["rounds"] = max(int(v["rounds"] or 0), int(t.rounds or 0))
+            ts = t.heartbeat_at or t.started_at
+            if ts:
+                cur = v["last_updated_at"]
+                if (not cur) or (ts > cur):
+                    v["last_updated_at"] = ts
+            acc_map[k] = v
+        data = []
+        for _, e in acc_map.items():
+            if e.get("last_updated_at"):
+                e["last_updated_at"] = e["last_updated_at"].isoformat()
+            data.append(e)
+        return JSONResponse(data)
+    finally:
+        db.close()
+
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int):
     db: Session = SessionLocal()
@@ -480,7 +522,9 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 db.commit()
 
             delay = max(delay_ms, 0) / 1000.0
-            for idx, gid in enumerate(group_ids):
+            ids = list(group_ids)
+            random.shuffle(ids)
+            for idx, gid in enumerate(ids):
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if t and t.stop_requested:
                     t.status = "stopped"

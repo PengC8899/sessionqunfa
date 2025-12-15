@@ -4,101 +4,219 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Telegram 群发控制面板</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=3.3" />
 </head>
 <body>
-  <header>
-    <h1>Telegram 群发控制面板</h1>
-    <div class="token-box">
-      <label>管理员令牌</label>
-      <input id="adminToken" type="password" placeholder="输入 X-Admin-Token" />
-      <button id="saveToken">保存令牌</button>
-      <button id="editToken" style="display:none;">编辑令牌</button>
-      <span id="tokenStatus" style="margin-left:8px;"></span>
-      <label style="margin-left:12px;">账号</label>
-      <select id="accountSelect"></select>
+  <div class="app-container">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <span>TG 群发面板</span>
+      </div>
+      <div class="sidebar-content">
+        <div class="group-search">
+          <div class="input-group" style="margin-bottom: 0;">
+            <input id="searchInput" type="text" class="input-field" placeholder="搜索群组..." />
+          </div>
+        </div>
+        <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem;">
+          <button id="selectAll" class="btn btn-secondary btn-sm flex-1">全选</button>
+          <button id="clearAll" class="btn btn-secondary btn-sm flex-1">清空</button>
+          <button id="refreshGroups" class="btn btn-secondary btn-sm flex-1">刷新</button>
+        </div>
+        <div style="margin-bottom:0.5rem; display:flex; align-items:center; justify-content:space-between;">
+          <label style="font-size:0.75rem; cursor:pointer; display:flex; align-items:center; gap:0.25rem;">
+            <input id="includeChannels" type="checkbox" /> 包含频道
+          </label>
+          <span id="groupCount" class="text-muted text-sm">加载中...</span>
+        </div>
+        <ul id="groupList" class="group-list"></ul>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <div class="main-content">
+      <!-- Top Navigation -->
+      <nav class="top-nav">
+        <div class="nav-left">
+          <div class="input-group" style="margin-bottom:0;">
+            <input id="adminToken" type="password" class="input-field" placeholder="输入管理员令牌" style="width: 200px;" />
+          </div>
+          <button id="saveToken" class="btn btn-primary btn-sm">保存</button>
+          <button id="editToken" class="btn btn-secondary btn-sm hidden">编辑</button>
+          <span id="tokenStatus" class="text-sm"></span>
+        </div>
+        <div class="nav-right" style="position: relative;">
+          <select id="accountSelect" class="select-field" style="width: 180px;"></select>
+          <button id="toggleLogin" class="btn btn-secondary btn-sm">账号登录</button>
+          <div id="loginPopover" class="login-popover">
+            <div class="flex-col gap-2">
+              <h3 style="font-size:1rem; font-weight:600; margin-bottom:0.5rem;">登录账号</h3>
+              <input id="loginPhone" type="text" class="input-field" placeholder="手机号 (带国家码)" />
+              <div style="display:flex; gap:0.5rem;">
+                <input id="loginCode" type="text" class="input-field" placeholder="验证码" />
+                <button id="sendCodeBtn" class="btn btn-secondary btn-sm">发送</button>
+              </div>
+              <input id="loginPassword" type="password" class="input-field" placeholder="二次密码 (可选)" />
+              <label class="text-sm" style="display:flex; align-items:center; gap:0.5rem;">
+                <input id="forceSms" type="checkbox" /> 强制短信验证
+              </label>
+              <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+                <button id="confirmLoginBtn" class="btn btn-primary flex-1">确认登录</button>
+                <button id="unlockAccount" class="btn btn-secondary flex-1 hidden">切换账号</button>
+              </div>
+              <div id="authStatus" class="text-sm text-center mt-4"></div>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <!-- Content Scroll Area -->
+      <div class="content-scroll">
+        <div class="content-grid">
+          <!-- Left Column: Send Config -->
+          <div class="flex-col gap-4">
+            <div class="panel">
+              <div class="panel-header">消息配置</div>
+              <div class="panel-body">
+                <div class="input-group">
+                  <textarea id="message" class="textarea-field" placeholder="在此输入要群发的消息内容..."></textarea>
+                </div>
+                <div class="row-inputs">
+                  <div class="input-group">
+                    <label class="input-label">解析模式</label>
+                    <select id="parseMode" class="select-field">
+                      <option value="plain">纯文本 (Plain)</option>
+                      <option value="markdown">Markdown</option>
+                      <option value="html">HTML</option>
+                    </select>
+                  </div>
+                  <div class="input-group">
+                    <label class="input-label">每条间隔 (ms)</label>
+                    <input id="delayMs" type="number" value="60000" class="input-field" />
+                  </div>
+                  <div class="input-group">
+                    <label class="input-label">发送轮数</label>
+                    <input id="rounds" type="number" value="30" min="1" class="input-field" />
+                  </div>
+                  <div class="input-group">
+                    <label class="input-label">每轮间隔 (s)</label>
+                    <input id="roundInterval" type="number" value="1200" min="0" class="input-field" />
+                  </div>
+                </div>
+                <div class="input-group">
+                  <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">
+                    <input id="disablePreview" type="checkbox" checked />
+                    <span class="text-sm">关闭链接预览</span>
+                  </label>
+                </div>
+                <div style="display:flex; gap:1rem; align-items:center;">
+                  <button id="sendBtn" class="btn btn-primary">发送到选中群组 (后台)</button>
+                  <button id="testBtn" class="btn btn-secondary">测试发送</button>
+                  <div id="result" class="text-sm" style="margin-left:auto;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Column: Global Status & Logs -->
+          <div class="flex-col gap-4">
+            <!-- Global Status (Moved Up) -->
+            <div class="panel" style="height: 400px;">
+              <div class="panel-header">
+                <span>全局任务监控</span>
+                <div style="display:flex; gap:0.5rem;">
+                  <input id="summarySearch" type="text" class="input-field" style="padding:0.25rem 0.5rem; width:100px; font-size:0.75rem;" placeholder="筛选..." />
+                  <button id="checkAccountsBtn" class="btn btn-secondary btn-sm">检查账号</button>
+                  <button id="summaryRefresh" class="btn btn-secondary btn-sm">刷新</button>
+                </div>
+              </div>
+              <div class="panel-body" style="padding:0; display:flex; flex-direction:column; height:100%;">
+                <div class="table-container" style="flex:1;">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th class="summarySort" data-key="account" style="cursor:pointer">账号</th>
+                        <th class="summarySort" data-key="progress" style="cursor:pointer">进度</th>
+                        <th class="summarySort" data-key="success" style="cursor:pointer">成功</th>
+                        <th class="summarySort" data-key="failed" style="cursor:pointer">失败</th>
+                      </tr>
+                    </thead>
+                    <tbody id="globalSummaryBody"></tbody>
+                  </table>
+                </div>
+                <div style="padding:0.5rem 1rem; border-top:1px solid var(--border-color); text-align:right;">
+                  <span id="summaryUpdatedAt" class="text-sm text-muted"></span>
+                  <span id="summaryLoading" class="text-sm text-muted hidden" style="margin-left:0.5rem;">加载中...</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Logs (Moved Down) -->
+            <div class="panel" style="flex: 1;">
+              <div class="panel-header">
+                <span>最近日志</span>
+                <button id="clearCacheBtn" class="btn btn-secondary btn-sm">清理缓存</button>
+              </div>
+              <div class="panel-body" style="padding:0;">
+                <div class="table-container">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>时间</th>
+                        <th>目标</th>
+                        <th>状态</th>
+                        <th>信息</th>
+                      </tr>
+                    </thead>
+                    <tbody id="logsBody"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="login-box" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
-      <input id="loginPhone" type="text" placeholder="手机号(含国家码)" style="width:200px;" />
-      <input id="loginCode" type="text" placeholder="验证码" style="width:100px;" />
-      <input id="loginPassword" type="password" placeholder="二次密码(如有)" style="width:160px;" />
-      <label><input id="forceSms" type="checkbox" /> 强制短信</label>
-      <button id="sendCodeBtn">发送验证码</button>
-      <button id="confirmLoginBtn">确认登录</button>
-      <button id="unlockAccount" style="display:none;">更换账号/重新登录</button>
-      <span id="authStatus" style="margin-left:8px;"></span>
+  </div>
+
+  <!-- Check Accounts Modal -->
+  <div id="checkModal" class="modal hidden">
+    <div class="modal-content" style="width: 600px; max-width: 90vw;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3 style="font-size:1.1rem; font-weight:600;">账号健康检查</h3>
+        <button id="closeCheckModal" style="background:none; border:none; font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+          <div style="display:flex; gap:0.5rem;">
+            <button id="startCheckBtn" class="btn btn-primary btn-sm">开始检查</button>
+            <button id="stopCheckBtn" class="btn btn-secondary btn-sm hidden">停止</button>
+          </div>
+          <div>
+            <span id="checkProgress" class="text-sm text-muted">就绪</span>
+          </div>
+        </div>
+        <div class="table-container" style="max-height:400px; overflow-y:auto; border:1px solid var(--border-color); border-radius:4px;">
+          <table style="width:100%; border-collapse:collapse;">
+            <thead style="background:var(--bg-secondary); position:sticky; top:0;">
+              <tr>
+                <th style="padding:0.5rem; text-align:left;">账号</th>
+                <th style="padding:0.5rem; text-align:left;">状态</th>
+                <th style="padding:0.5rem; text-align:left;">详情</th>
+                <th style="padding:0.5rem; text-align:right;">操作</th>
+              </tr>
+            </thead>
+            <tbody id="checkResultsBody"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:1rem; text-align:right;">
+           <button id="clearInvalidBtn" class="btn btn-danger btn-sm" disabled>一键清理失效账号</button>
+        </div>
+      </div>
     </div>
-  </header>
+  </div>
 
-  <main>
-    <section class="left">
-      <div class="search-box">
-        <input id="searchInput" type="text" placeholder="搜索群名" />
-        <div class="actions">
-          <button id="selectAll">全选</button>
-          <button id="clearAll">取消全选</button>
-          <button id="refreshGroups">刷新群列表</button>
-          <button id="clearCacheBtn">清除缓存</button>
-          <button id="debugGroups">诊断群列表</button>
-        </div>
-      </div>
-      <div class="row" style="margin-top:8px;">
-        <label><input id="includeChannels" type="checkbox" /> 包含频道</label>
-        <span id="groupCount" style="margin-left:12px;"></span>
-      </div>
-      <ul id="groupList"></ul>
-    </section>
-
-    <section class="right">
-      <div class="form">
-        <textarea id="message" rows="10" placeholder="输入要发送的消息"></textarea>
-        <div class="row">
-          <label>解析模式</label>
-          <select id="parseMode">
-            <option value="plain">plain</option>
-            <option value="markdown">markdown</option>
-            <option value="html">html</option>
-          </select>
-        </div>
-        <div class="row">
-          <label>每条间隔(ms)</label>
-          <input id="delayMs" type="number" value="600000" />
-        </div>
-        <div class="row">
-          <label>发送轮数</label>
-          <input id="rounds" type="number" value="1" min="1" step="1" />
-        </div>
-        <div class="row">
-          <label>每轮间隔(s)</label>
-          <input id="roundInterval" type="number" value="1200" min="0" step="60" />
-        </div>
-        <div class="row">
-          <label><input id="disablePreview" type="checkbox" checked /> 关闭链接预览</label>
-        </div>
-        <div class="actions">
-          <button id="sendBtn">发送到选中群组</button>
-          <button id="testBtn">发送测试消息</button>
-        </div>
-        <div id="result" class="result"></div>
-      </div>
-      <div class="logs">
-        <h2>最近日志</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>群名</th>
-              <th>状态</th>
-              <th>消息ID</th>
-              <th>错误</th>
-            </tr>
-          </thead>
-          <tbody id="logsBody"></tbody>
-        </table>
-      </div>
-    </section>
-  </main>
-
-  <script src="/static/app.js?v=1.1"></script>
+  <script src="/static/app.js?v=3.3"></script>
 </body>
 </html>

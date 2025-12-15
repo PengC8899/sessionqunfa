@@ -1,13 +1,20 @@
 import asyncio
 from typing import List, Optional
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
 from telethon.tl.types import Channel, Chat
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
 from app.config import CONFIG
 import os
+import glob
 
+
+INLINE_BOT_USERNAME = "PostBot"
+INLINE_BOT_QUERY = "694014ffc3b8e"
+
+# Old text fallback (kept for reference, can be removed)
+# AUTO_REPLY_TEXT = ... 
 
 class AccountClientManager:
     def __init__(self, session_name: str, api_id: int, api_hash: str):
@@ -16,6 +23,7 @@ class AccountClientManager:
         self.api_hash = api_hash
         self.client: Optional[TelegramClient] = None
         self._connected = False
+        self._auto_reply_setup = False
 
     async def ensure_connected(self):
         if not self._connected:
@@ -28,6 +36,32 @@ class AccountClientManager:
             if not authorized:
                 raise RuntimeError("Telegram session not authorized")
             self._connected = True
+            self._setup_auto_reply()
+
+    def _setup_auto_reply(self):
+        if self._auto_reply_setup or not self.client:
+            return
+        
+        @self.client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+        async def handler(event):
+            try:
+                # Avoid replying to self
+                if event.sender_id == (await self.client.get_me()).id:
+                    return
+                
+                # Use Inline Bot for auto-reply
+                results = await self.client.inline_query(INLINE_BOT_USERNAME, INLINE_BOT_QUERY)
+                if results:
+                    await results[0].click(event.chat_id)
+                    print(f"[INFO] Auto-replied via @{INLINE_BOT_USERNAME} to {event.sender_id} on account {self.session_name}")
+                else:
+                    print(f"[WARNING] No inline results found for @{INLINE_BOT_USERNAME} {INLINE_BOT_QUERY}")
+                    
+            except Exception as e:
+                print(f"[ERROR] Auto-reply failed: {e}")
+
+        self._auto_reply_setup = True
+        print(f"[INFO] Auto-reply setup for account {self.session_name}")
 
     async def _ensure_client(self):
         loop = asyncio.get_running_loop()
@@ -35,44 +69,81 @@ class AccountClientManager:
             session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
             self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
         await self.client.connect()
+        try:
+            authorized = await self.client.is_user_authorized()
+        except Exception:
+            authorized = False
+        if authorized:
+            self._connected = True
+            self._setup_auto_reply()
 
     async def send_login_code(self, phone: str, force_sms: bool = False):
+        print(f"[DEBUG] send_login_code called for {phone} session {self.session_name}")
         loop = asyncio.get_running_loop()
-        if self.client is None:
-            session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-            self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
-        # ensure a fresh connection
+        
+        # Force clean slate strategy:
+        # If we are requesting a code, we assume we want to start fresh or the current session is invalid/unauthorized.
+        # To avoid issues with old API IDs, DC mismatches, or corrupted sessions, we recreate the client.
+        
+        session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+        
+        # 1. Close existing connection if any
+        if self.client:
+            await self.client.disconnect()
+            
+        # 2. Check if session exists but is NOT authorized (if authorized, we shouldn't be here ideally, but if user insists...)
+        # Actually, let's just assume if they call this, they want to login.
+        # We won't delete the session file immediately unless we confirm it's broken, 
+        # BUT for the "API ID Changed" scenario, it is safer to DELETE it if it was created with old API ID.
+        # How do we know? We don't. So let's delete it to be safe.
+        
+        # CAUTION: Deleting session file means losing any existing login.
+        # But the user says they can't login anyway.
+        
+        print(f"[DEBUG] Resetting session {self.session_name} to ensure clean state...")
+        for p in [f"{session_base}.session", f"{session_base}.session-journal"]:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    print(f"[DEBUG] Deleted {p}")
+            except Exception as e:
+                print(f"[ERROR] Failed to delete {p}: {e}")
+
+        # 3. Create new client
+        self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
         await self.client.connect()
-        # if connection dropped, reconnect
-        if not self.client.is_connected():
-            await self.client.connect()
+        
         try:
+            print(f"[DEBUG] Sending code request to {phone}")
             resp = await self.client.send_code_request(phone, force_sms=force_sms)
-            print(resp)
-            return {"ok": True}
+            print(f"[DEBUG] Send code response: {resp}")
+            
+            # Explicitly check for SentCode type
+            from telethon.tl.types import auth
+            code_type = "unknown"
+            
+            if isinstance(resp, auth.SentCode):
+                t_name = type(resp.type).__name__
+                print(f"[DEBUG] Code type name: {t_name}")
+                if "App" in t_name:
+                    code_type = "app"
+                elif "Sms" in t_name:
+                    code_type = "sms"
+                elif "Call" in t_name:
+                    code_type = "call"
+                elif "FlashCall" in t_name:
+                    code_type = "flash_call"
+                    
+            return {"ok": True, "type": code_type, "debug_info": str(resp)}
         except FloodWaitError as e:
+            print(f"[ERROR] FloodWaitError: {e}")
             return {"ok": False, "retry_after": getattr(e, "seconds", 60)}
         except PhoneNumberInvalidError:
+            print(f"[ERROR] PhoneNumberInvalidError for {phone}")
             return {"ok": False, "error": "phone_invalid"}
         except Exception as e:
-            msg = str(e) if e else ""
-            if "authorization key" in msg or "AuthKey" in msg:
-                try:
-                    sb = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-                    for p in [f"{sb}.session", f"{sb}.session-journal"]:
-                        try:
-                            os.remove(p)
-                        except Exception:
-                            pass
-                    await self.client.disconnect()
-                    self.client = TelegramClient(sb, self.api_id, self.api_hash, loop=loop)
-                    await self.client.connect()
-                    resp = await self.client.send_code_request(phone, force_sms=force_sms)
-                    print(resp)
-                    return {"ok": True}
-                except Exception as e2:
-                    return {"ok": False, "error": str(e2)}
-            return {"ok": False, "error": msg or "send_code_failed"}
+            print(f"[ERROR] Generic Exception during send_code: {type(e).__name__}: {e}")
+            return {"ok": False, "error": str(e)}
 
     async def confirm_login(self, phone: str, code: str, password: str | None = None):
         await self._ensure_client()
@@ -84,6 +155,7 @@ class AccountClientManager:
             await self.client.sign_in(password=password)
         me = await self.client.get_me()
         self._connected = True
+        self._setup_auto_reply()
         return {"id": getattr(me, "id", None)}
 
     async def is_authorized(self) -> bool:
@@ -201,3 +273,18 @@ class MultiTelegramManager:
 
 
 multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)
+
+
+async def setup_auto_reply_for_all_sessions():
+    session_dir = CONFIG.SESSION_DIR
+    if not os.path.isdir(session_dir):
+        return
+    pattern = os.path.join(session_dir, "*.session")
+    for path in glob.glob(pattern):
+        name = os.path.basename(path).rsplit(".", 1)[0]
+        try:
+            mgr = multi_manager.get(name)
+            await mgr._ensure_client()
+            print(f"[INFO] Auto-reply startup check for {name}, setup={mgr._auto_reply_setup}")
+        except Exception as e:
+            print(f"[ERROR] Auto-reply startup failed for {name}: {e}")

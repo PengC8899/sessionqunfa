@@ -14,6 +14,8 @@ services:
     volumes:
       - ./sessions:/sessions
       - ./data:/app/data
+      - ./templates:/app/templates:ro
+      - ./static:/app/static:ro
     restart: unless-stopped
   caddy:
     image: caddy:2-alpine
