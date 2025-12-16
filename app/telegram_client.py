@@ -42,6 +42,15 @@ class AccountClientManager:
         if self._auto_reply_setup or not self.client:
             return
         
+        # Check environment variable to enable/disable auto-reply
+        # Default is True ("true", "1", "yes" all count as True)
+        enable_auto_reply = os.getenv("ENABLE_AUTO_REPLY", "true").lower() in ("true", "1", "yes")
+        
+        if not enable_auto_reply:
+            print(f"[INFO] Auto-reply DISABLED for account {self.session_name} (ENABLE_AUTO_REPLY={os.getenv('ENABLE_AUTO_REPLY')})")
+            self._auto_reply_setup = True
+            return
+
         @self.client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
         async def handler(event):
             try:
