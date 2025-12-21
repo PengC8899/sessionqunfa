@@ -36,32 +36,7 @@
   - **更新**: 自动回复文案同步
   - **功能**: 随机群发顺序同步
 
-## 3. 东京 VPS (Tokyo)
-- **IP 地址**: `18.176.68.231`
-- **SSH 用户**: `ubuntu`
-- **密钥文件**: `/Users/pclucky/qunfa/dongjing-222.pem`
-- **部署路径**: `~/qunfa`
-- **配置概览**:
-  - `ADMIN_TOKEN`: `123456`
-  - `ACCOUNT_COUNT`: 100
-- **状态**: 🟢 正常运行 (New)
-- **最近维护**:
-  - **全新部署**: 安装 Docker/Compose 环境
-  - **代码同步**: 同步最新自动回复和随机发送逻辑
-  - **权限设置**: 配置私钥连接
 
-## 4. 东京 VPS 2 (Xiaoke-1)
-- **IP 地址**: `54.150.58.14`
-- **SSH 用户**: `ubuntu`
-- **密钥文件**: `/Users/pclucky/qunfa/xiaoke2.pem`
-- **部署路径**: `~/qunfa`
-- **配置概览**:
-  - `ACCOUNT_COUNT`: 100
-- **状态**: 🟢 正常运行 (New) - **DO NOT UPDATE**
-- **最近维护**:
-  - **全新部署**: 安装 Docker/Compose 环境
-  - **代码同步**: 同步最新自动回复 (High-Volume Corporate Accounts)
-  - **⚠️ 注意**: 用户指定此 VPS 配置不应修改，除非明确要求。
 
 ## 5. 备用配置 (Backup Config)
 ### 备用 Telegram API Credentials
@@ -82,11 +57,7 @@ ssh -i xinjiapo.pem ubuntu@47.130.222.65
 # 连接孟买 VPS
 ssh -i mengmai.pem ubuntu@13.203.174.210
 
-# 连接东京 VPS
-ssh -o StrictHostKeyChecking=no -i dongjing-222.pem ubuntu@18.176.68.231
 
-# 连接东京 VPS 2 (Xiaoke-1)
-ssh -o StrictHostKeyChecking=no -i xiaoke2.pem ubuntu@54.150.58.14
 ```
 
 ### 重启服务

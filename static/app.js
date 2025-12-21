@@ -709,20 +709,37 @@ async function startCheck() {
     tr.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     
     try {
+      // 创建带超时的 AbortController
+      const timeoutController = new AbortController();
+      const timeoutId = setTimeout(() => timeoutController.abort(), 20000); // 20秒超时
+      
+      // 合并用户停止信号和超时信号
+      const combinedSignal = checkAbortController.signal;
+      checkAbortController.signal.addEventListener('abort', () => timeoutController.abort());
+      
       const res = await fetch('/api/accounts/check-single', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
         body: JSON.stringify({ account: acc }),
-        signal: checkAbortController.signal
+        signal: timeoutController.signal
       });
       
+      clearTimeout(timeoutId);
       const data = await res.json();
       results.push(data);
       updateRow(tr, data);
       
     } catch (e) {
-      if (e.name === 'AbortError') break;
-      updateRow(tr, { account: acc, valid: false, status: 'network_error', detail: e.message });
+      if (e.name === 'AbortError') {
+        // 检查是用户停止还是超时
+        if (!checkAbortController.signal.aborted) {
+          updateRow(tr, { account: acc, valid: false, status: 'timeout', detail: '请求超时' });
+        } else {
+          break;
+        }
+      } else {
+        updateRow(tr, { account: acc, valid: false, status: 'network_error', detail: e.message });
+      }
     }
     
     processed++;

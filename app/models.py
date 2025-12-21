@@ -64,3 +64,16 @@ class TaskEvent(Base):
     event = Column(String(32))
     detail = Column(Text)
     meta_json = Column(Text)
+
+
+class AccountHealth(Base):
+    """账号健康状态跟踪"""
+    __tablename__ = "account_health"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_name = Column(String(64), unique=True, index=True)
+    status = Column(String(32), default="pending")  # ok, error, pending, banned
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    last_join_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

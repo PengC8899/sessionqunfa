@@ -12,14 +12,17 @@ from sqlalchemy.orm import Session
 from app.models import SendLog, Task, TaskEvent
 from app.services.send_service import send_to_groups
 from app.services.group_service import get_groups, clear_group_cache
+# from app.services.multi_account_sender import get_multi_sender  # 暂不使用
 from app.routers.accounts import check_single_account, delete_account
+from app.routers.system import reset_system
+from app.services.account_service import account_service
 import json
 import time
 import uuid
 import asyncio
 import os
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 app = Starlette()
 
@@ -61,6 +64,7 @@ async def list_accounts_status(request: Request):
 
 app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
 app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
+app.add_route("/api/system/reset", reset_system, methods=["POST"])
 
 @app.route("/api/groups")
 async def list_groups(request: Request):
@@ -171,7 +175,7 @@ async def send(request: Request):
     message = (body.get("message") or "").strip()
     parse_mode = body.get("parse_mode") or "plain"
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
-    delay_ms = int(body.get("delay_ms", 60000))
+    delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     retry_max = int(body.get("retry_max", getattr(CONFIG, "SEND_RETRY_MAX", 0)))
     retry_delay_ms = int(body.get("retry_delay_ms", getattr(CONFIG, "SEND_RETRY_DELAY_MS", 1500)))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
@@ -345,6 +349,9 @@ async def startup_event():
     except Exception:
         pass
 
+    # 设置 account_service 的 manager 引用（用于健康检查）
+    account_service.set_manager(multi_manager)
+
     db: Session = SessionLocal()
     try:
         rows = db.query(Task).filter(Task.status == "running").limit(100).all()
@@ -399,7 +406,7 @@ async def send_async(request: Request):
     message = (body.get("message") or "").strip()
     parse_mode = body.get("parse_mode") or "plain"
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
-    delay_ms = int(body.get("delay_ms", 60000))
+    delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
     rounds = int(body.get("rounds", 30))
     round_interval_s = int(body.get("round_interval_s", 600))
@@ -510,6 +517,26 @@ async def tasks_summary(request: Request):
         db.close()
 
 
+async def _run_send_task_with_delay(
+    task_id: str,
+    account: str,
+    group_ids: list[int],
+    message: str,
+    parse_mode: str,
+    disable_web_page_preview: bool,
+    delay_ms: int,
+    rounds: int,
+    round_interval_s: int,
+    start_delay: float = 0,
+):
+    """带延迟启动的发送任务包装器"""
+    if start_delay > 0:
+        print(f"[TASK] {account}: waiting {start_delay:.1f}s before starting...")
+        await asyncio.sleep(start_delay)
+    print(f"[TASK] {account}: starting send task (task_id={task_id[:8]}...)")
+    await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s)
+
+
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int):
     db: Session = SessionLocal()
     try:
@@ -528,7 +555,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if t and t.stop_requested:
                     t.status = "stopped"
-                    t.finished_at = datetime.now(timezone.utc)
+                    t.finished_at = CONFIG.now()
                     db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
                     db.commit()
                     return  # Stop the entire task
@@ -571,7 +598,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     else:
                         t.failed = (t.failed or 0) + 1
                     t.current_index = (t.current_index or 0) + 1
-                    t.heartbeat_at = datetime.now(timezone.utc)
+                    t.heartbeat_at = CONFIG.now()
                     db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
                 db.commit()
 
@@ -581,21 +608,21 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             if current_round < rounds:
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if t:
-                    t.next_round_at = datetime.now(timezone.utc) + timedelta(seconds=round_interval_s)
+                    t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
                     db.commit()
                 await asyncio.sleep(round_interval_s)
 
         t = db.query(Task).filter(Task.id == task_id).first()
         if t and t.status not in ("stopped", "error"):
             t.status = "done"
-            t.finished_at = datetime.now(timezone.utc)
+            t.finished_at = CONFIG.now()
             db.add(TaskEvent(task_id=task_id, event="finished", detail="task_done", meta_json=json.dumps({}, ensure_ascii=False)))
             db.commit()
     except Exception as e:
         t = db.query(Task).filter(Task.id == task_id).first()
         if t:
             t.status = "error"
-            t.finished_at = datetime.now(timezone.utc)
+            t.finished_at = CONFIG.now()
             db.add(TaskEvent(task_id=task_id, event="error", detail=f"task_error: {e}", meta_json=json.dumps({}, ensure_ascii=False)))
             db.commit()
     finally:
@@ -610,10 +637,11 @@ async def login_send_code(request: Request):
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     phone = body.get("phone")
     force_sms = body.get("force_sms", False)
+    force_new_session = body.get("force_new_session", False)
     if not phone:
         return JSONResponse({"detail": "phone required"}, status_code=400)
     try:
-        resp = await multi_manager.send_login_code(account, phone, force_sms=force_sms)
+        resp = await multi_manager.send_login_code(account, phone, force_sms=force_sms, force_new_session=force_new_session)
         return JSONResponse(resp)
     except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
@@ -648,3 +676,375 @@ async def account_status(request: Request):
         return JSONResponse({"authorized": authorized})
     except Exception as e:
         return JSONResponse({"authorized": False, "detail": str(e)})
+
+
+@app.route("/api/session/validate", methods=["POST"])
+async def validate_session(request: Request):
+    """验证上传的 session 文件是否有效（不会删除 session）"""
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    account = body.get("account")
+    if not account:
+        return JSONResponse({"detail": "account required"}, status_code=400)
+    try:
+        result = await multi_manager.validate_session(account)
+        return JSONResponse({"account": account, **result})
+    except Exception as e:
+        return JSONResponse({"account": account, "valid": False, "error": str(e)})
+
+
+@app.route("/api/session/validate-batch", methods=["POST"])
+async def validate_sessions_batch(request: Request):
+    """批量验证多个 session 文件"""
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    accounts = body.get("accounts") or []
+    
+    # 如果没有指定账号，则验证所有已存在的 session 文件
+    if not accounts:
+        session_dir = CONFIG.SESSION_DIR
+        if os.path.isdir(session_dir):
+            for f in os.listdir(session_dir):
+                if f.endswith(".session"):
+                    accounts.append(f.rsplit(".", 1)[0])
+    
+    results = []
+    # 使用信号量限制并发
+    sem = asyncio.Semaphore(5)
+    
+    async def validate_one(acc: str):
+        async with sem:
+            try:
+                result = await multi_manager.validate_session(acc)
+                return {"account": acc, **result}
+            except Exception as e:
+                return {"account": acc, "valid": False, "error": str(e)}
+    
+    tasks = [validate_one(acc) for acc in accounts]
+    results = await asyncio.gather(*tasks)
+    
+    summary = {
+        "total": len(results),
+        "authorized": sum(1 for r in results if r.get("authorized")),
+        "unauthorized": sum(1 for r in results if r.get("valid") and not r.get("authorized")),
+        "invalid": sum(1 for r in results if not r.get("valid")),
+    }
+    return JSONResponse({"summary": summary, "results": results})
+
+
+@app.route("/api/send-multi-account", methods=["POST"])
+@app.route("/api/send-async-batch", methods=["POST"])
+async def send_multi_account(request: Request):
+    """
+    使用多个账号并发发送消息 - 为每个账号创建单独的任务
+    
+    请求体:
+    {
+        "accounts": ["account_01", "account_02", ...],  // 可选，不填则使用所有已授权账号
+        "group_ids": [123, 456, ...],
+        "message": "消息内容",
+        "parse_mode": "plain|markdown|html",
+        "disable_web_page_preview": true,
+        "delay_ms": 11000,  // 默认 11 秒
+        "rounds": 1,
+        "round_interval_s": 600,
+        "stagger_min_s": 120,  // 账号启动间隔最小秒数
+        "stagger_max_s": 300   // 账号启动间隔最大秒数
+    }
+    """
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    
+    body = await request.json()
+    group_ids = body.get("group_ids") or []
+    message = (body.get("message") or "").strip()
+    parse_mode = body.get("parse_mode") or "plain"
+    disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
+    delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
+    delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
+    rounds = int(body.get("rounds", 1))
+    round_interval_s = int(body.get("round_interval_s", 600))
+    # 错开延迟：默认 10-30 秒，防风控但不会等太久
+    stagger_min_s = float(body.get("stagger_min_s", 10))
+    stagger_max_s = float(body.get("stagger_max_s", 30))
+    request_id = body.get("request_id")
+    
+    # 防重复请求
+    ok, reason = _check_request_guard(token, request_id)
+    if not ok:
+        return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
+    
+    if not group_ids or not message:
+        return JSONResponse({"detail": "group_ids and message required"}, status_code=400)
+    
+    # 获取账号列表
+    accounts = body.get("accounts") or []
+    if not accounts:
+        # 自动获取所有已授权的账号
+        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
+        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+        session_dir = CONFIG.SESSION_DIR
+        
+        for i in range(1, count + 1):
+            name = f"{prefix}_{i:02d}"
+            session_path = os.path.join(session_dir, f"{name}.session")
+            if os.path.exists(session_path):
+                accounts.append(name)
+    
+    if not accounts:
+        return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
+    
+    # 直接使用有 session 文件的账号，授权检查在发送时进行（更快）
+    # 为每个账号创建单独的任务
+    task_ids = []
+    db: Session = SessionLocal()
+    try:
+        for acc in accounts:
+            task_id = uuid.uuid4().hex[:24]
+            t = Task(
+                id=task_id,
+                status="running",
+                total=len(group_ids),
+                success=0,
+                failed=0,
+                account_name=acc,  # 单个账号名
+                message=message,
+                parse_mode=parse_mode,
+                disable_web_page_preview=1 if disable_web_page_preview else 0,
+                delay_ms=delay_ms,
+                rounds=rounds,
+                round_interval_s=round_interval_s,
+                current_index=0,
+                group_ids_json=json.dumps(group_ids),
+                request_id=request_id,
+            )
+            db.add(t)
+            db.add(TaskEvent(
+                task_id=task_id, 
+                event="created", 
+                detail="task_created",
+                meta_json=json.dumps({"count": len(group_ids)}, ensure_ascii=False)
+            ))
+            task_ids.append({"account": acc, "task_id": task_id})
+        db.commit()
+    finally:
+        db.close()
+    
+    # 为每个账号启动单独的发送任务，带有错开延迟
+    cumulative_delay = 0.0
+    for i, item in enumerate(task_ids):
+        # 计算累积启动延迟 (每个账号间隔 stagger_min_s ~ stagger_max_s 秒)
+        if i > 0:
+            cumulative_delay += random.uniform(stagger_min_s, stagger_max_s)
+        asyncio.create_task(_run_send_task_with_delay(
+            task_id=item["task_id"],
+            account=item["account"],
+            group_ids=group_ids,
+            message=message,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            delay_ms=delay_ms,
+            rounds=rounds,
+            round_interval_s=round_interval_s,
+            start_delay=cumulative_delay,
+        ))
+    
+    return JSONResponse({
+        "tasks": task_ids,
+        "accounts_count": len(accounts),
+        "stagger_min_s": stagger_min_s,
+        "stagger_max_s": stagger_max_s,
+    })
+
+
+@app.route("/api/groups/join", methods=["POST"])
+async def join_group(request: Request):
+    """
+    使用指定账号加入群组
+    
+    请求体:
+    {
+        "account": "account_01",
+        "invite_link": "https://t.me/+xxxxx" 或 "@groupname"
+    }
+    """
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    
+    body = await request.json()
+    account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
+    invite_link = (body.get("invite_link") or "").strip()
+    
+    if not invite_link:
+        return JSONResponse({"detail": "invite_link required"}, status_code=400)
+    
+    try:
+        # 检查账号是否已授权
+        authorized = await multi_manager.is_authorized(account)
+        if not authorized:
+            return JSONResponse({"detail": "account_not_authorized"}, status_code=403)
+        
+        result = await multi_manager.join_group(account, invite_link)
+        return JSONResponse({"account": account, **result})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.route("/api/groups/join-batch", methods=["POST"])
+async def join_groups_batch(request: Request):
+    """
+    批量加入群组 (多账号)
+    
+    请求体:
+    {
+        "accounts": ["account_01", "account_02", ...],  // 可选
+        "invite_links": ["https://t.me/+xxx", "@group1", ...],
+        "delay_ms": 5000  // 每次加群之间的延迟
+    }
+    """
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    
+    body = await request.json()
+    invite_links = body.get("invite_links") or []
+    delay_ms = int(body.get("delay_ms", 5000))
+    
+    if not invite_links:
+        return JSONResponse({"detail": "invite_links required"}, status_code=400)
+    
+    # 获取账号列表
+    accounts = body.get("accounts") or []
+    if not accounts:
+        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
+        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+        session_dir = CONFIG.SESSION_DIR
+        
+        for i in range(1, count + 1):
+            name = f"{prefix}_{i:02d}"
+            session_path = os.path.join(session_dir, f"{name}.session")
+            if os.path.exists(session_path):
+                accounts.append(name)
+    
+    if not accounts:
+        return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
+    
+    # 验证账号授权状态
+    authorized_accounts = []
+    for acc in accounts:
+        try:
+            if await multi_manager.is_authorized(acc):
+                authorized_accounts.append(acc)
+        except:
+            pass
+    
+    if not authorized_accounts:
+        return JSONResponse({"detail": "no_authorized_accounts"}, status_code=400)
+    
+    results = []
+    sem = asyncio.Semaphore(3)  # 限制并发
+    
+    async def join_one(account: str, link: str, stagger_delay: float = 0):
+        # 先等待错开延迟，再获取信号量
+        if stagger_delay > 0:
+            await asyncio.sleep(stagger_delay)
+        async with sem:
+            try:
+                result = await multi_manager.join_group(account, link)
+                return {"account": account, "invite_link": link, **result}
+            except Exception as e:
+                return {"account": account, "invite_link": link, "ok": False, "error": str(e)}
+    
+    # 为每个邀请链接选择一个账号，带错开延迟
+    tasks = []
+    for i, link in enumerate(invite_links):
+        # 轮询分配账号
+        acc = authorized_accounts[i % len(authorized_accounts)]
+        # 计算错开延迟 (在任务内部执行)
+        stagger_delay = i * (delay_ms / 1000.0) if delay_ms > 0 else 0
+        tasks.append(join_one(acc, link, stagger_delay))
+    
+    results = await asyncio.gather(*tasks)
+    
+    summary = {
+        "total": len(results),
+        "success": sum(1 for r in results if r.get("ok")),
+        "already_joined": sum(1 for r in results if r.get("already_joined")),
+        "failed": sum(1 for r in results if not r.get("ok") and not r.get("already_joined")),
+    }
+    
+    return JSONResponse({"summary": summary, "results": results})
+
+
+@app.route("/api/groups/join-all-accounts", methods=["POST"])
+async def join_group_all_accounts(request: Request):
+    """
+    让所有账号加入同一个群组
+    
+    请求体:
+    {
+        "accounts": ["account_01", ...],  // 可选
+        "invite_link": "https://t.me/+xxxxx",
+        "delay_ms": 3000  // 每个账号之间的延迟 (防风控)
+    }
+    """
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    
+    body = await request.json()
+    invite_link = (body.get("invite_link") or "").strip()
+    delay_ms = int(body.get("delay_ms", 3000))
+    
+    if not invite_link:
+        return JSONResponse({"detail": "invite_link required"}, status_code=400)
+    
+    # 获取账号列表
+    accounts = body.get("accounts") or []
+    if not accounts:
+        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
+        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+        session_dir = CONFIG.SESSION_DIR
+        
+        for i in range(1, count + 1):
+            name = f"{prefix}_{i:02d}"
+            session_path = os.path.join(session_dir, f"{name}.session")
+            if os.path.exists(session_path):
+                accounts.append(name)
+    
+    results = []
+    
+    for i, acc in enumerate(accounts):
+        try:
+            # 先检查授权
+            authorized = await multi_manager.is_authorized(acc)
+            if not authorized:
+                results.append({"account": acc, "ok": False, "error": "not_authorized"})
+                continue
+            
+            result = await multi_manager.join_group(acc, invite_link)
+            results.append({"account": acc, **result})
+            
+            # 延迟 (防风控)
+            if delay_ms > 0 and i < len(accounts) - 1:
+                # 添加随机抖动
+                jitter = random.uniform(-0.2, 0.2) * delay_ms
+                await asyncio.sleep((delay_ms + jitter) / 1000.0)
+                
+        except Exception as e:
+            results.append({"account": acc, "ok": False, "error": str(e)})
+    
+    summary = {
+        "total": len(results),
+        "success": sum(1 for r in results if r.get("ok")),
+        "already_joined": sum(1 for r in results if r.get("already_joined")),
+        "failed": sum(1 for r in results if not r.get("ok") and not r.get("already_joined")),
+    }
+    
+    return JSONResponse({"summary": summary, "results": results})

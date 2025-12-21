@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, timezone as tz
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,6 +20,11 @@ class Settings:
     SEND_JITTER_PCT: float
     GROUP_CACHE_TTL_SECONDS: int
     GROUP_CACHE_ENABLED: int
+    TIMEZONE: str
+    # 多账号并发配置
+    MULTI_ACCOUNT_ENABLED: int
+    MULTI_ACCOUNT_MAX_CONCURRENT: int
+    MULTI_ACCOUNT_STAGGER_MS: int
 
     def __init__(self):
         admin_token = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_PASSWORD")
@@ -44,6 +51,15 @@ class Settings:
         except Exception:
             self.ACCOUNT_COUNT = 20
         self.ACCOUNT_PREFIX = os.getenv("ACCOUNT_PREFIX", "account")
+        
+        # 时区配置 - 默认使用 Asia/Singapore (新加坡) 或 Asia/Kolkata (孟买)
+        self.TIMEZONE = os.getenv("TIMEZONE", "Asia/Singapore")
+        
+        # 多账号并发配置
+        self.MULTI_ACCOUNT_ENABLED = int(os.getenv("MULTI_ACCOUNT_ENABLED", "1"))
+        self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "5"))
+        # 账号之间的发送间隔 (ms)，防止风控
+        self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "3000"))
 
         accounts_list = (os.getenv("TG_ACCOUNTS") or "").strip()
         accounts: dict = {}
@@ -75,6 +91,22 @@ class Settings:
             self.DEFAULT_ACCOUNT = session_name
 
         self.ACCOUNTS = accounts
+
+    def now(self) -> datetime:
+        """获取当前时间 (服务器配置的时区)"""
+        try:
+            tz_info = ZoneInfo(self.TIMEZONE)
+            return datetime.now(tz_info)
+        except Exception:
+            # 如果时区配置无效，回退到 UTC
+            return datetime.now(tz.utc)
+
+    def get_timezone(self):
+        """获取配置的时区对象"""
+        try:
+            return ZoneInfo(self.TIMEZONE)
+        except Exception:
+            return tz.utc
 
 
 CONFIG = Settings()
