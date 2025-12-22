@@ -22,12 +22,31 @@ import uuid
 import asyncio
 import os
 import random
+import logging
 from datetime import datetime, timedelta
 
 app = Starlette()
 
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+def _discover_session_accounts() -> list[str]:
+    session_dir = CONFIG.SESSION_DIR
+    try:
+        items = os.listdir(session_dir)
+    except Exception:
+        return []
+    names: list[str] = []
+    for filename in items:
+        if not filename.endswith(".session"):
+            continue
+        if filename.endswith(".session-journal"):
+            continue
+        name = filename[:-8]
+        if not name:
+            continue
+        names.append(name)
+    return sorted(set(names))
 
 
 @app.middleware("http")
@@ -49,7 +68,10 @@ async def list_accounts_status(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
     prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
-    names = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
+    prefix_names = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
+    prefix_set = set(prefix_names)
+    extra_names = [n for n in _discover_session_accounts() if n not in prefix_set]
+    names = prefix_names + extra_names
     data = []
     
     session_dir = CONFIG.SESSION_DIR
@@ -65,6 +87,171 @@ async def list_accounts_status(request: Request):
 app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
 app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
 app.add_route("/api/system/reset", reset_system, methods=["POST"])
+
+
+@app.route("/api/accounts/upload-sessions", methods=["POST"])
+async def upload_sessions(request: Request):
+    """上传 session 文件"""
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    
+    form = await request.form()
+    files = form.getlist("files")
+    
+    if not files:
+        return JSONResponse({"detail": "No files uploaded"}, status_code=400)
+    
+    uploaded = 0
+    errors = []
+    validated_accounts = []
+    
+    for file in files:
+        try:
+            filename = file.filename
+            if not filename.endswith('.session'):
+                errors.append(f"{filename}: 不是 .session 文件")
+                continue
+            
+            # 提取账号名 (去掉 .session 后缀)
+            account_name = filename[:-8]  # Remove .session
+            target_path = os.path.join(CONFIG.SESSION_DIR, filename)
+            
+            # 保存文件
+            content = await file.read()
+            with open(target_path, 'wb') as f:
+                f.write(content)
+            
+            # 断开旧连接（如果存在）
+            if account_name in multi_manager.managers:
+                try:
+                    await multi_manager.managers[account_name].disconnect()
+                    logging.info(f"[UPLOAD] Disconnected old session for {account_name}")
+                except Exception:
+                    pass
+            
+            # 简单验证：只检查文件大小，不实际连接（避免数据库操作）
+            try:
+                import os as os_module
+                file_size = os_module.path.getsize(target_path)
+                if file_size > 5000:  # Session 文件通常大于 5KB
+                    validated_accounts.append(account_name)
+                    logging.info(f"[UPLOAD] Session file uploaded for {account_name} ({file_size} bytes)")
+                else:
+                    errors.append(f"{account_name}: 文件太小，可能损坏 ({file_size} bytes)")
+            except Exception as e:
+                errors.append(f"{account_name}: 文件检查失败 - {str(e)[:50]}")
+            
+            uploaded += 1
+        except Exception as e:
+            errors.append(f"{file.filename}: {str(e)}")
+    
+    return JSONResponse({
+        "uploaded": uploaded,
+        "validated": len(validated_accounts),
+        "validated_accounts": validated_accounts,
+        "errors": errors if errors else None
+    })
+
+@app.route("/api/accounts/assign-sequence", methods=["POST"])
+async def assign_sequence(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+
+    accounts = body.get("accounts") or []
+    if not isinstance(accounts, list) or not all(isinstance(a, str) for a in accounts):
+        return JSONResponse({"detail": "accounts must be a list of strings"}, status_code=400)
+
+    action = (body.get("action") or "copy").strip().lower()
+    overwrite = bool(body.get("overwrite", False))
+    if action not in ("copy", "move"):
+        return JSONResponse({"detail": "action must be copy|move"}, status_code=400)
+
+    count = int(getattr(CONFIG, "ACCOUNT_COUNT", 100))
+    prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+    session_dir = CONFIG.SESSION_DIR
+
+    targets = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
+    available_targets: list[str] = []
+    for t in targets:
+        dst_path = os.path.join(session_dir, f"{t}.session")
+        if overwrite or not os.path.exists(dst_path):
+            available_targets.append(t)
+
+    assigned = []
+    skipped = []
+    errors = []
+
+    idx = 0
+    for src in accounts:
+        src_name = src.strip()
+        if not src_name:
+            continue
+        src_path = os.path.join(session_dir, f"{src_name}.session")
+        if not os.path.exists(src_path):
+            errors.append(f"{src_name}: session_not_found")
+            continue
+        if idx >= len(available_targets):
+            skipped.append(src_name)
+            continue
+
+        dst_name = available_targets[idx]
+        idx += 1
+        dst_path = os.path.join(session_dir, f"{dst_name}.session")
+
+        if not overwrite and os.path.exists(dst_path):
+            skipped.append(src_name)
+            continue
+
+        try:
+            with open(src_path, "rb") as f:
+                data = f.read()
+            with open(dst_path, "wb") as f:
+                f.write(data)
+
+            src_journal = f"{src_path}-journal"
+            dst_journal = f"{dst_path}-journal"
+            if os.path.exists(src_journal):
+                with open(src_journal, "rb") as f:
+                    jdata = f.read()
+                with open(dst_journal, "wb") as f:
+                    f.write(jdata)
+
+            if action == "move":
+                try:
+                    os.remove(src_path)
+                except Exception:
+                    pass
+                if os.path.exists(src_journal):
+                    try:
+                        os.remove(src_journal)
+                    except Exception:
+                        pass
+
+            if dst_name in multi_manager.managers:
+                try:
+                    await multi_manager.managers[dst_name].disconnect()
+                except Exception:
+                    pass
+
+            assigned.append({"from": src_name, "to": dst_name})
+        except Exception as e:
+            errors.append(f"{src_name} -> {dst_name}: {type(e).__name__}: {str(e)}")
+
+    return JSONResponse({
+        "ok": True,
+        "assigned": assigned,
+        "skipped": skipped,
+        "errors": errors,
+        "available_slots": len(available_targets),
+    })
+
 
 @app.route("/api/groups")
 async def list_groups(request: Request):
@@ -351,6 +538,9 @@ async def startup_event():
 
     # 设置 account_service 的 manager 引用（用于健康检查）
     account_service.set_manager(multi_manager)
+    
+    # 启动定期清理空闲连接的后台任务
+    asyncio.create_task(_periodic_connection_cleanup())
 
     db: Session = SessionLocal()
     try:
@@ -370,6 +560,16 @@ async def startup_event():
 
 _REQ_IDS: dict[str, float] = {}
 _LAST_TS: dict[str, float] = {}
+
+
+async def _periodic_connection_cleanup():
+    """定期清理空闲的 Telegram 连接以节省内存"""
+    while True:
+        try:
+            await asyncio.sleep(60)  # 每分钟检查一次
+            await multi_manager._cleanup_idle_connections()
+        except Exception as e:
+            print(f"[CLEANUP] Error: {e}")
 
 
 def _check_request_guard(token: str, request_id: str | None, window_ms: int = 500):
@@ -539,6 +739,9 @@ async def _run_send_task_with_delay(
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int):
     db: Session = SessionLocal()
+    consecutive_failures = 0  # 连续失败计数器
+    MAX_CONSECUTIVE_FAILURES = 10  # 最大连续失败次数
+    
     try:
         for i in range(rounds):
             current_round = i + 1
@@ -595,8 +798,33 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 if t:
                     if ok:
                         t.success = (t.success or 0) + 1
+                        consecutive_failures = 0  # 成功则重置计数器
                     else:
                         t.failed = (t.failed or 0) + 1
+                        consecutive_failures += 1  # 失败则增加计数器
+                        
+                        # 检查是否达到连续失败上限
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            print(f"[AUTO-STOP] {account}: {consecutive_failures} consecutive failures, stopping task and clearing session")
+                            t.status = "error"
+                            t.finished_at = CONFIG.now()
+                            db.add(TaskEvent(
+                                task_id=task_id, 
+                                event="auto_stopped", 
+                                detail=f"连续失败{consecutive_failures}次，自动停止并清除登录信息",
+                                meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
+                            ))
+                            db.commit()
+                            
+                            # 清除该账号的 session 文件
+                            try:
+                                await account_service.delete_session(account)
+                                print(f"[AUTO-STOP] {account}: session deleted")
+                            except Exception as del_err:
+                                print(f"[AUTO-STOP] {account}: failed to delete session: {del_err}")
+                            
+                            return  # 停止任务
+                            
                     t.current_index = (t.current_index or 0) + 1
                     t.heartbeat_at = CONFIG.now()
                     db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
@@ -785,15 +1013,16 @@ async def send_multi_account(request: Request):
     # 获取账号列表
     accounts = body.get("accounts") or []
     if not accounts:
-        # 自动获取所有已授权的账号
         count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
         prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
         session_dir = CONFIG.SESSION_DIR
-        
         for i in range(1, count + 1):
             name = f"{prefix}_{i:02d}"
             session_path = os.path.join(session_dir, f"{name}.session")
             if os.path.exists(session_path):
+                accounts.append(name)
+        for name in _discover_session_accounts():
+            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
                 accounts.append(name)
     
     if not accounts:
@@ -925,11 +1154,13 @@ async def join_groups_batch(request: Request):
         count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
         prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
         session_dir = CONFIG.SESSION_DIR
-        
         for i in range(1, count + 1):
             name = f"{prefix}_{i:02d}"
             session_path = os.path.join(session_dir, f"{name}.session")
             if os.path.exists(session_path):
+                accounts.append(name)
+        for name in _discover_session_accounts():
+            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
                 accounts.append(name)
     
     if not accounts:
@@ -1016,6 +1247,9 @@ async def join_group_all_accounts(request: Request):
             name = f"{prefix}_{i:02d}"
             session_path = os.path.join(session_dir, f"{name}.session")
             if os.path.exists(session_path):
+                accounts.append(name)
+        for name in _discover_session_accounts():
+            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
                 accounts.append(name)
     
     results = []

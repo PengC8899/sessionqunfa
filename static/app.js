@@ -844,3 +844,875 @@ async function clearInvalidAccounts() {
   alert('清理完成');
   document.getElementById('clearInvalidBtn').disabled = true;
 }
+
+// ========== Account Management ==========
+function setupAccountManage() {
+  const modal = document.getElementById('accountManageModal');
+  const openBtn = document.getElementById('accountManageBtn');
+  const closeBtn = document.getElementById('closeAccountManageModal');
+  const uploadBtn = document.getElementById('uploadSessionBtn');
+  const batchJoinBtn = document.getElementById('batchJoinBtn');
+  
+  if (!modal || !openBtn) return;
+  
+  openBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    loadAccountList();
+  });
+  
+  closeBtn.addEventListener('click', () => {
+    modal.classList.add('hidden');
+  });
+  
+  uploadBtn.addEventListener('click', uploadSessionFiles);
+  batchJoinBtn?.addEventListener('click', batchJoinGroups);
+}
+
+async function loadAccountList() {
+  const container = document.getElementById('accountListContainer');
+  const countEl = document.getElementById('accountCount');
+  
+  container.innerHTML = '<p class="text-muted text-sm">加载中...</p>';
+  
+  try {
+    // Use the accounts from state
+    const accounts = state.accounts || [];
+    countEl.textContent = accounts.length;
+    
+    if (accounts.length === 0) {
+      container.innerHTML = '<p class="text-muted text-sm">暂无账号</p>';
+      return;
+    }
+    
+    let html = '<div style="display:flex; flex-wrap:wrap; gap:0.5rem;">';
+    for (const acc of accounts) {
+      html += `<span style="background:var(--bg-secondary); padding:0.25rem 0.5rem; border-radius:4px; font-size:0.8rem;">${acc}</span>`;
+    }
+    html += '</div>';
+    container.innerHTML = html;
+    
+  } catch (e) {
+    container.innerHTML = `<p class="text-danger text-sm">加载失败: ${e.message}</p>`;
+  }
+}
+
+async function uploadSessionFiles() {
+  const fileInput = document.getElementById('sessionFileInput');
+  const statusEl = document.getElementById('uploadStatus');
+  
+  if (!fileInput.files || fileInput.files.length === 0) {
+    statusEl.textContent = '请选择文件';
+    return;
+  }
+  
+  statusEl.textContent = '上传中...';
+  
+  const formData = new FormData();
+  for (const file of fileInput.files) {
+    formData.append('files', file);
+  }
+  
+  try {
+    const res = await fetch('/api/accounts/upload-sessions', {
+      method: 'POST',
+      headers: { 'X-Admin-Token': state.token },
+      body: formData
+    });
+    
+    const data = await res.json();
+    
+    if (res.ok) {
+      statusEl.textContent = `上传成功: ${data.uploaded || 0} 个文件`;
+      fileInput.value = '';
+      loadAccountList();
+      fetchAuthStatus(); // Refresh account list
+    } else {
+      statusEl.textContent = `上传失败: ${data.detail || '未知错误'}`;
+    }
+  } catch (e) {
+    statusEl.textContent = `上传出错: ${e.message}`;
+  }
+}
+
+async function batchJoinGroups() {
+  const linksInput = document.getElementById('joinLinksInput');
+  const modeSelect = document.getElementById('joinMode');
+  const delayInput = document.getElementById('joinDelayMs');
+  const statusEl = document.getElementById('joinStatus');
+  const btn = document.getElementById('batchJoinBtn');
+  
+  // 解析链接
+  const linksText = linksInput?.value?.trim();
+  if (!linksText) {
+    statusEl.textContent = '请输入邀请链接';
+    return;
+  }
+  
+  const links = linksText.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && (l.includes('t.me') || l.startsWith('@')));
+  
+  if (links.length === 0) {
+    statusEl.textContent = '未找到有效链接';
+    return;
+  }
+  
+  const mode = modeSelect?.value || 'all';
+  const delayMs = parseInt(delayInput?.value) || 3000;
+  
+  // 确认
+  const modeText = mode === 'all' ? '所有账号加入每个群' : '分配账号到不同群';
+  if (!confirm(`确定要批量加入 ${links.length} 个群组吗？\n\n模式: ${modeText}\n延迟: ${delayMs}ms`)) {
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '加入中...';
+  statusEl.textContent = '正在批量加入群组...';
+  
+  try {
+    let endpoint, body;
+    
+    if (mode === 'all') {
+      // 所有账号加入每个群 - 需要逐个群调用
+      let successCount = 0;
+      let failCount = 0;
+      
+      for (let i = 0; i < links.length; i++) {
+        const link = links[i];
+        statusEl.textContent = `正在加入 ${i + 1}/${links.length}: ${link.substring(0, 30)}...`;
+        
+        try {
+          const res = await fetch('/api/groups/join-all-accounts', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+            body: JSON.stringify({ invite_link: link, delay_ms: delayMs })
+          });
+          
+          const data = await res.json();
+          if (data.summary) {
+            successCount += data.summary.success || 0;
+            failCount += data.summary.failed || 0;
+          }
+        } catch (e) {
+          failCount++;
+        }
+        
+        // 群组之间延迟
+        if (i < links.length - 1) {
+          await new Promise(r => setTimeout(r, delayMs));
+        }
+      }
+      
+      statusEl.textContent = `✅ 完成! 成功: ${successCount}, 失败: ${failCount}`;
+      statusEl.style.color = 'var(--success-color)';
+      
+    } else {
+      // 分配模式 - 使用 join-batch API
+      const res = await fetch('/api/groups/join-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+        body: JSON.stringify({ invite_links: links, delay_ms: delayMs })
+      });
+      
+      const data = await res.json();
+      
+      if (res.ok && data.summary) {
+        statusEl.textContent = `✅ 完成! 成功: ${data.summary.success}, 已加入: ${data.summary.already_joined}, 失败: ${data.summary.failed}`;
+        statusEl.style.color = 'var(--success-color)';
+      } else {
+        statusEl.textContent = `❌ ${data.detail || '加入失败'}`;
+        statusEl.style.color = 'var(--danger-color)';
+      }
+    }
+    
+  } catch (e) {
+    statusEl.textContent = `❌ 请求出错: ${e.message}`;
+    statusEl.style.color = 'var(--danger-color)';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '开始加入';
+  }
+}
+
+// ========== Reset System ==========
+function setupResetSystem() {
+  const btn = document.getElementById('resetSystemBtn');
+  if (!btn) return;
+  
+  btn.addEventListener('click', async () => {
+    const confirmText = prompt('此操作将清除所有任务和日志数据！\n\n如果同时要删除所有账号登录信息，请输入 "DELETE_ALL"\n否则直接点击确定只清除任务数据:');
+    
+    if (confirmText === null) return; // Cancelled
+    
+    const resetSessions = confirmText === 'DELETE_ALL';
+    
+    try {
+      const res = await fetch(`/api/system/reset?sessions=${resetSessions}`, {
+        method: 'POST',
+        headers: { 'X-Admin-Token': state.token }
+      });
+      
+      const data = await res.json();
+      
+      if (res.ok) {
+        alert(`重置成功！${resetSessions ? `\n删除了 ${data.deleted_sessions || 0} 个账号` : ''}`);
+        location.reload();
+      } else {
+        alert(`重置失败: ${data.detail || '未知错误'}`);
+      }
+    } catch (e) {
+      alert(`重置出错: ${e.message}`);
+    }
+  });
+}
+
+// ========== Batch Send ==========
+function setupBatchSend() {
+  const btn = document.getElementById('batchSendBtn');
+  if (!btn) return;
+  
+  btn.addEventListener('click', startBatchSend);
+}
+
+async function startBatchSend() {
+  const btn = document.getElementById('batchSendBtn');
+  const resultEl = document.getElementById('result');
+  
+  // 获取选中的群组
+  const checkboxes = document.querySelectorAll('#groupList input[type="checkbox"]:checked');
+  const groupIds = Array.from(checkboxes).map(cb => parseInt(cb.value));
+  
+  if (groupIds.length === 0) {
+    alert('请先选择要发送的群组');
+    return;
+  }
+  
+  // 获取消息内容
+  const message = document.getElementById('message')?.value?.trim();
+  if (!message) {
+    alert('请输入消息内容');
+    return;
+  }
+  
+  // 获取发送参数
+  const parseMode = document.getElementById('parseMode')?.value || 'plain';
+  const delayMs = parseInt(document.getElementById('delayMs')?.value) || 11000;
+  const rounds = parseInt(document.getElementById('rounds')?.value) || 1;
+  const roundIntervalS = parseInt(document.getElementById('roundInterval')?.value) || 600;
+  const disablePreview = document.getElementById('disablePreview')?.checked ?? true;
+  
+  // 确认
+  if (!confirm(`确定要使用所有已授权账号批量发送到 ${groupIds.length} 个群组吗？\n\n每条间隔: ${delayMs}ms\n发送轮数: ${rounds}\n每轮间隔: ${roundIntervalS}s`)) {
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '批量创建任务中...';
+  resultEl.textContent = '正在创建批量任务...';
+  
+  try {
+    const res = await fetch('/api/send-async-batch', {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json', 
+        'X-Admin-Token': state.token 
+      },
+      body: JSON.stringify({
+        group_ids: groupIds,
+        message: message,
+        parse_mode: parseMode,
+        disable_web_page_preview: disablePreview,
+        delay_ms: delayMs,
+        rounds: rounds,
+        round_interval_s: roundIntervalS,
+        request_id: `batch_${Date.now()}`
+      })
+    });
+    
+    const data = await res.json();
+    
+    if (res.ok) {
+      const taskCount = data.tasks?.length || data.accounts_count || 0;
+      resultEl.textContent = `✅ 已创建 ${taskCount} 个任务`;
+      resultEl.style.color = 'var(--success-color)';
+      
+      // 刷新任务列表
+      if (typeof fetchSummary === 'function') {
+        fetchSummary();
+      }
+    } else {
+      resultEl.textContent = `❌ ${data.detail || '创建失败'}`;
+      resultEl.style.color = 'var(--danger-color)';
+    }
+  } catch (e) {
+    resultEl.textContent = `❌ 请求出错: ${e.message}`;
+    resultEl.style.color = 'var(--danger-color)';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '批量开始群发 (已授权账号)';
+  }
+}
+
+// Initialize new features
+document.addEventListener('DOMContentLoaded', () => {
+  setupAccountManage();
+  setupResetSystem();
+  setupBatchSend();
+  setupLoginTabs();
+  setupSessionUpload();
+  setupProtocolManager();
+});
+
+// ========== Login Tabs ==========
+function setupLoginTabs() {
+  const tabCode = document.getElementById('tabLoginCode');
+  const tabSession = document.getElementById('tabLoginSession');
+  const codePanel = document.getElementById('loginCodePanel');
+  const sessionPanel = document.getElementById('loginSessionPanel');
+  
+  if (!tabCode || !tabSession) return;
+  
+  tabCode.addEventListener('click', () => {
+    tabCode.classList.add('active');
+    tabSession.classList.remove('active');
+    tabCode.style.borderBottom = '2px solid var(--primary-color)';
+    tabSession.style.borderBottom = '2px solid transparent';
+    codePanel.style.display = 'block';
+    sessionPanel.style.display = 'none';
+  });
+  
+  tabSession.addEventListener('click', () => {
+    tabSession.classList.add('active');
+    tabCode.classList.remove('active');
+    tabSession.style.borderBottom = '2px solid var(--primary-color)';
+    tabCode.style.borderBottom = '2px solid transparent';
+    sessionPanel.style.display = 'block';
+    codePanel.style.display = 'none';
+  });
+  
+  // 初始化状态
+  tabCode.style.borderBottom = '2px solid var(--primary-color)';
+}
+
+// ========== Session Upload ==========
+function setupSessionUpload() {
+  const uploadBtn = document.getElementById('uploadSessionFileBtn');
+  const joinBtn = document.getElementById('joinGroupsBtn');
+  
+  if (uploadBtn) {
+    uploadBtn.addEventListener('click', uploadSessionFile);
+  }
+  
+  if (joinBtn) {
+    joinBtn.addEventListener('click', joinGroupsFromLogin);
+  }
+}
+
+async function uploadSessionFile() {
+  const fileInput = document.getElementById('sessionFileUpload');
+  const statusEl = document.getElementById('sessionStatus');
+  const accountSelect = document.getElementById('accountSelect');
+  
+  if (!fileInput.files || fileInput.files.length === 0) {
+    statusEl.textContent = '请选择 session 文件';
+    statusEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  const currentAccount = accountSelect?.value;
+  if (!currentAccount) {
+    statusEl.textContent = '请先选择一个账号';
+    statusEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  const file = fileInput.files[0];
+  
+  // 检查文件名是否与当前账号匹配
+  const fileName = file.name.replace('.session', '');
+  if (fileName !== currentAccount) {
+    if (!confirm(`文件名 "${fileName}" 与当前账号 "${currentAccount}" 不匹配。\n确定要上传吗？\n\n注意：文件将被重命名为 ${currentAccount}.session`)) {
+      return;
+    }
+  }
+  
+  statusEl.textContent = '上传中...';
+  statusEl.style.color = 'var(--text-muted)';
+  
+  const formData = new FormData();
+  
+  // 创建新的 File 对象，使用当前账号名
+  const renamedFile = new File([file], `${currentAccount}.session`, { type: file.type });
+  formData.append('files', renamedFile);
+  
+  try {
+    const res = await fetch('/api/accounts/upload-sessions', {
+      method: 'POST',
+      headers: { 'X-Admin-Token': state.token },
+      body: formData
+    });
+    
+    const data = await res.json();
+    
+    if (res.ok) {
+      if (data.validated > 0) {
+        statusEl.textContent = `✅ 上传成功！已验证 ${data.validated} 个账号`;
+        statusEl.style.color = 'var(--success-color)';
+        fileInput.value = '';
+        
+        // 显示详细信息
+        if (data.validated_accounts && data.validated_accounts.length > 0) {
+          statusEl.textContent += `\n已验证账号: ${data.validated_accounts.join(', ')}`;
+        }
+        
+        if (data.errors && data.errors.length > 0) {
+          statusEl.textContent += `\n\n警告:\n${data.errors.join('\n')}`;
+          statusEl.style.color = 'orange';
+        }
+        
+        // 刷新账号列表
+        setTimeout(() => {
+          fetchAuthStatus();
+          // 自动选择刚上传的账号
+          if (accountSelect) {
+            accountSelect.value = currentAccount;
+          }
+          // 刷新群组列表
+          const refreshBtn = document.getElementById('refreshGroups');
+          if (refreshBtn) refreshBtn.click();
+        }, 1500);
+      } else {
+        statusEl.textContent = `⚠️ 文件已上传，但验证失败\n${data.errors ? data.errors.join('\n') : ''}`;
+        statusEl.style.color = 'orange';
+      }
+    } else {
+      statusEl.textContent = `❌ 上传失败: ${data.detail || '未知错误'}`;
+      statusEl.style.color = 'var(--danger-color)';
+    }
+  } catch (e) {
+    statusEl.textContent = `❌ 上传出错: ${e.message}`;
+    statusEl.style.color = 'var(--danger-color)';
+  }
+}
+
+async function joinGroupsFromLogin() {
+  const linksInput = document.getElementById('joinGroupLinks');
+  const statusEl = document.getElementById('sessionStatus');
+  const accountSelect = document.getElementById('accountSelect');
+  
+  const currentAccount = accountSelect?.value;
+  if (!currentAccount) {
+    statusEl.textContent = '请先选择一个账号';
+    statusEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  const linksText = linksInput?.value?.trim();
+  if (!linksText) {
+    statusEl.textContent = '请输入群组链接';
+    statusEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  const links = linksText.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && (l.includes('t.me') || l.startsWith('@')));
+  
+  if (links.length === 0) {
+    statusEl.textContent = '未找到有效链接';
+    statusEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  statusEl.textContent = `正在加入 ${links.length} 个群组...`;
+  statusEl.style.color = 'var(--text-muted)';
+  
+  let successCount = 0;
+  let failCount = 0;
+  
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    statusEl.textContent = `正在加入 ${i + 1}/${links.length}: ${link.substring(0, 20)}...`;
+    
+    try {
+      const res = await fetch('/api/groups/join', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Admin-Token': state.token 
+        },
+        body: JSON.stringify({ 
+          account: currentAccount, 
+          invite_link: link 
+        })
+      });
+      
+      const data = await res.json();
+      if (data.ok || data.already_joined) {
+        successCount++;
+      } else {
+        failCount++;
+      }
+    } catch (e) {
+      failCount++;
+    }
+    
+    // 延迟避免触发风控
+    if (i < links.length - 1) {
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+  
+  statusEl.textContent = `✅ 完成！成功: ${successCount}, 失败: ${failCount}`;
+  statusEl.style.color = 'var(--success-color)';
+  
+  // 清空输入框
+  linksInput.value = '';
+  
+  // 刷新群组列表
+  setTimeout(() => {
+    const refreshBtn = document.getElementById('refreshGroups');
+    if (refreshBtn) refreshBtn.click();
+  }, 1000);
+}
+
+// ========== Protocol Manager ==========
+let protocolAccounts = []; // 存储上传的协议号列表
+let protocolValidAccounts = [];
+
+function setupProtocolManager() {
+  const openBtn = document.getElementById('openProtocolManager');
+  const modal = document.getElementById('protocolManagerModal');
+  const closeBtn = document.getElementById('closeProtocolManager');
+  const uploadBtn = document.getElementById('uploadProtocolsBtn');
+  const verifyBtn = document.getElementById('verifyProtocolsBtn');
+  const joinBtn = document.getElementById('batchJoinProtocolBtn');
+  const assignBtn = document.getElementById('assignProtocolsBtn');
+  
+  if (!openBtn || !modal) return;
+  
+  openBtn.addEventListener('click', () => {
+    modal.classList.remove('hidden');
+    protocolAccounts = [];
+    protocolValidAccounts = [];
+    if (assignBtn) assignBtn.disabled = true;
+  });
+  
+  closeBtn.addEventListener('click', () => {
+    modal.classList.add('hidden');
+  });
+  
+  uploadBtn?.addEventListener('click', uploadProtocolFiles);
+  verifyBtn?.addEventListener('click', verifyProtocolAccounts);
+  joinBtn?.addEventListener('click', batchJoinWithProtocols);
+  assignBtn?.addEventListener('click', assignProtocolAccountsToSequence);
+}
+
+async function uploadProtocolFiles() {
+  const fileInput = document.getElementById('protocolFiles');
+  const progressEl = document.getElementById('uploadProgress');
+  const btn = document.getElementById('uploadProtocolsBtn');
+  
+  if (!fileInput.files || fileInput.files.length === 0) {
+    progressEl.textContent = '❌ 请选择文件';
+    progressEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '上传中...';
+  progressEl.textContent = `正在上传 ${fileInput.files.length} 个文件...`;
+  progressEl.style.color = 'var(--text-muted)';
+  
+  const formData = new FormData();
+  protocolAccounts = [];
+  
+  for (const file of fileInput.files) {
+    formData.append('files', file);
+    const accountName = file.name.replace('.session', '');
+    protocolAccounts.push(accountName);
+  }
+  
+  try {
+    const res = await fetch('/api/accounts/upload-sessions', {
+      method: 'POST',
+      headers: { 'X-Admin-Token': state.token },
+      body: formData
+    });
+    
+    const data = await res.json();
+    
+    if (res.ok) {
+      progressEl.textContent = `✅ 成功上传 ${data.uploaded} 个文件\n\n账号列表:\n${protocolAccounts.join('\n')}`;
+      progressEl.style.color = 'var(--success-color)';
+      
+      if (data.errors && data.errors.length > 0) {
+        progressEl.textContent += `\n\n⚠️ 警告:\n${data.errors.join('\n')}`;
+        progressEl.style.color = 'orange';
+      }
+      
+      fileInput.value = '';
+      try { await fetchAccounts(); } catch {}
+    } else {
+      progressEl.textContent = `❌ 上传失败: ${data.detail || '未知错误'}`;
+      progressEl.style.color = 'var(--danger-color)';
+    }
+  } catch (e) {
+    progressEl.textContent = `❌ 上传出错: ${e.message}`;
+    progressEl.style.color = 'var(--danger-color)';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '上传全部';
+  }
+}
+
+async function verifyProtocolAccounts() {
+  const listEl = document.getElementById('protocolStatusList');
+  const btn = document.getElementById('verifyProtocolsBtn');
+  const assignBtn = document.getElementById('assignProtocolsBtn');
+  const assignProgress = document.getElementById('assignProgress');
+  
+  if (protocolAccounts.length === 0) {
+    listEl.innerHTML = '<p class="text-danger">❌ 请先上传协议号文件</p>';
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '验证中...';
+  listEl.innerHTML = '<p class="text-muted">正在验证账号状态...</p>';
+  
+  let html = '<table style="width:100%; border-collapse: collapse; font-size:0.85rem;">';
+  html += '<thead><tr style="background:var(--bg-secondary);"><th style="padding:0.5rem; text-align:left;">账号</th><th style="padding:0.5rem;">状态</th><th style="padding:0.5rem;">详情</th></tr></thead><tbody>';
+  
+  let validCount = 0;
+  let invalidCount = 0;
+  protocolValidAccounts = [];
+  
+  for (const account of protocolAccounts) {
+    try {
+      const res = await fetch('/api/accounts/check-single', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Admin-Token': state.token
+        },
+        body: JSON.stringify({ account })
+      });
+      
+      const data = await res.json();
+      
+      let statusIcon, statusText, statusColor;
+      if (data.valid) {
+        statusIcon = '✅';
+        statusText = '可用';
+        statusColor = 'var(--success-color)';
+        validCount++;
+        protocolValidAccounts.push(account);
+      } else {
+        statusIcon = '❌';
+        statusText = '不可用';
+        statusColor = 'var(--danger-color)';
+        invalidCount++;
+      }
+      
+      const detail = data.detail || data.status || '-';
+      html += `<tr style="border-bottom:1px solid var(--border-color);">
+        <td style="padding:0.5rem;">${account}</td>
+        <td style="padding:0.5rem; text-align:center; color:${statusColor};">${statusIcon} ${statusText}</td>
+        <td style="padding:0.5rem; font-size:0.75rem; color:var(--text-muted);">${detail}</td>
+      </tr>`;
+      
+    } catch (e) {
+      html += `<tr style="border-bottom:1px solid var(--border-color);">
+        <td style="padding:0.5rem;">${account}</td>
+        <td style="padding:0.5rem; text-align:center; color:var(--danger-color);">❌ 错误</td>
+        <td style="padding:0.5rem; font-size:0.75rem; color:var(--text-muted);">${e.message}</td>
+      </tr>`;
+      invalidCount++;
+    }
+  }
+  
+  html += '</tbody></table>';
+  html += `<div style="margin-top:1rem; padding:0.75rem; background:var(--bg-secondary); border-radius:4px; text-align:center;">
+    <strong>✅ 可用: ${validCount}</strong> | <strong style="color:var(--danger-color);">❌ 不可用: ${invalidCount}</strong>
+  </div>`;
+  
+  listEl.innerHTML = html;
+  btn.disabled = false;
+  btn.textContent = '重新验证';
+  try { await fetchAccounts(); } catch {}
+  if (assignProgress) assignProgress.textContent = '';
+  if (assignBtn) assignBtn.disabled = protocolValidAccounts.length === 0;
+}
+
+async function assignProtocolAccountsToSequence() {
+  const btn = document.getElementById('assignProtocolsBtn');
+  const progressEl = document.getElementById('assignProgress');
+  if (!btn || !progressEl) return;
+  if (protocolValidAccounts.length === 0) {
+    progressEl.textContent = '❌ 没有可加入的账号，请先验证';
+    progressEl.style.color = 'var(--danger-color)';
+    return;
+  }
+  if (!confirm(`确定要把 ${protocolValidAccounts.length} 个验证成功的账号加入账号序列吗？\n\n系统会按顺序填充空的 account_XX 槽位，不会覆盖已有账号。`)) {
+    return;
+  }
+  btn.disabled = true;
+  progressEl.textContent = '处理中...';
+  progressEl.style.color = 'var(--text-muted)';
+  try {
+    const res = await fetch('/api/accounts/assign-sequence', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Token': state.token
+      },
+      body: JSON.stringify({ accounts: protocolValidAccounts })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      progressEl.textContent = `❌ 操作失败: ${data.detail || '未知错误'}`;
+      progressEl.style.color = 'var(--danger-color)';
+      return;
+    }
+    const assigned = data.assigned || [];
+    const skipped = data.skipped || [];
+    const errors = data.errors || [];
+    let text = `✅ 已加入账号序列: ${assigned.length}`;
+    if (assigned.length) {
+      text += `\n\n映射:\n` + assigned.map(x => `${x.from} → ${x.to}`).join('\n');
+    }
+    if (skipped.length) {
+      text += `\n\n⚠️ 未分配(槽位不足或被跳过):\n` + skipped.join('\n');
+    }
+    if (errors.length) {
+      text += `\n\n⚠️ 错误:\n` + errors.join('\n');
+    }
+    progressEl.textContent = text;
+    progressEl.style.color = assigned.length ? 'var(--success-color)' : 'orange';
+    try { await fetchAccounts(); } catch {}
+  } catch (e) {
+    progressEl.textContent = `❌ 请求失败: ${e.message}`;
+    progressEl.style.color = 'var(--danger-color)';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function batchJoinWithProtocols() {
+  const linksInput = document.getElementById('protocolGroupLinks');
+  const delayInput = document.getElementById('protocolDelay');
+  const groupDelayInput = document.getElementById('protocolGroupDelay');
+  const btn = document.getElementById('batchJoinProtocolBtn');
+  const progressBar = document.getElementById('joinProgressBar');
+  const progressFill = document.getElementById('joinProgressFill');
+  const progressText = document.getElementById('joinProgressText');
+  const resultsEl = document.getElementById('joinResultsList');
+  
+  if (protocolAccounts.length === 0) {
+    resultsEl.innerHTML = '<p class="text-danger">❌ 请先上传并验证协议号</p>';
+    return;
+  }
+  
+  const linksText = linksInput?.value?.trim();
+  if (!linksText) {
+    resultsEl.innerHTML = '<p class="text-danger">❌ 请输入群组链接</p>';
+    return;
+  }
+  
+  const links = linksText.split('\n')
+    .map(l => l.trim())
+    .filter(l => l && (l.includes('t.me') || l.startsWith('@')));
+  
+  if (links.length === 0) {
+    resultsEl.innerHTML = '<p class="text-danger">❌ 未找到有效链接</p>';
+    return;
+  }
+  
+  const accountDelay = parseInt(delayInput?.value) || 5;
+  const groupDelay = parseInt(groupDelayInput?.value) || 3;
+  
+  if (!confirm(`确定要使用 ${protocolAccounts.length} 个协议号加入 ${links.length} 个群组吗？\n\n账号间隔: ${accountDelay}秒\n群组间隔: ${groupDelay}秒`)) {
+    return;
+  }
+  
+  btn.disabled = true;
+  btn.textContent = '加入中...';
+  progressBar.style.display = 'block';
+  resultsEl.innerHTML = '';
+  
+  let totalTasks = protocolAccounts.length * links.length;
+  let completedTasks = 0;
+  let successCount = 0;
+  let failCount = 0;
+  
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+    
+    progressText.textContent = `正在加入第 ${i + 1}/${links.length} 个群组...`;
+    
+    for (let j = 0; j < protocolAccounts.length; j++) {
+      const account = protocolAccounts[j];
+      
+      progressText.textContent = `群组 ${i + 1}/${links.length} | 账号 ${j + 1}/${protocolAccounts.length}`;
+      
+      try {
+        const res = await fetch('/api/groups/join', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Admin-Token': state.token
+          },
+          body: JSON.stringify({ account, invite_link: link })
+        });
+        
+        const data = await res.json();
+        
+        let resultIcon, resultText, resultColor;
+        if (data.ok || data.already_joined) {
+          resultIcon = '✅';
+          resultText = data.already_joined ? '已加入' : '成功';
+          resultColor = 'var(--success-color)';
+          successCount++;
+        } else {
+          resultIcon = '❌';
+          resultText = data.error || '失败';
+          resultColor = 'var(--danger-color)';
+          failCount++;
+        }
+        
+        resultsEl.innerHTML += `<div style="padding:0.25rem; border-bottom:1px solid var(--border-color); color:${resultColor};">
+          ${resultIcon} <strong>${account}</strong> → ${link.substring(0, 30)}... : ${resultText}
+        </div>`;
+        resultsEl.scrollTop = resultsEl.scrollHeight;
+        
+      } catch (e) {
+        resultsEl.innerHTML += `<div style="padding:0.25rem; border-bottom:1px solid var(--border-color); color:var(--danger-color);">
+          ❌ <strong>${account}</strong> → ${link.substring(0, 30)}... : 错误 - ${e.message}
+        </div>`;
+        failCount++;
+      }
+      
+      completedTasks++;
+      const progress = (completedTasks / totalTasks) * 100;
+      progressFill.style.width = `${progress}%`;
+      
+      // 账号间延迟（最后一个账号不延迟）
+      if (j < protocolAccounts.length - 1) {
+        await new Promise(r => setTimeout(r, accountDelay * 1000));
+      }
+    }
+    
+    // 群组间延迟（最后一个群组不延迟）
+    if (i < links.length - 1) {
+      progressText.textContent = `等待 ${groupDelay} 秒后加入下一个群组...`;
+      await new Promise(r => setTimeout(r, groupDelay * 1000));
+    }
+  }
+  
+  progressText.textContent = `✅ 全部完成！成功: ${successCount}, 失败: ${failCount}`;
+  progressFill.style.width = '100%';
+  btn.disabled = false;
+  btn.textContent = '🚀 开始批量加入';
+}

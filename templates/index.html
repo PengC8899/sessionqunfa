@@ -49,23 +49,52 @@
         <div class="nav-right" style="position: relative;">
           <select id="accountSelect" class="select-field" style="width: 180px;"></select>
           <button id="toggleLogin" class="btn btn-secondary btn-sm">账号登录</button>
+          <button id="openProtocolManager" class="btn btn-primary btn-sm" style="background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);">协议号管理</button>
           <div id="loginPopover" class="login-popover">
             <div class="flex-col gap-2">
-              <h3 style="font-size:1rem; font-weight:600; margin-bottom:0.5rem;">登录账号</h3>
-              <input id="loginPhone" type="text" class="input-field" placeholder="手机号 (带国家码)" />
-              <div style="display:flex; gap:0.5rem;">
-                <input id="loginCode" type="text" class="input-field" placeholder="验证码" />
-                <button id="sendCodeBtn" class="btn btn-secondary btn-sm">发送</button>
+              <!-- Tab 切换 -->
+              <div style="display:flex; gap:0.5rem; margin-bottom:0.5rem; border-bottom:2px solid var(--border-color);">
+                <button id="tabLoginCode" class="tab-btn active" style="flex:1; padding:0.5rem; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">验证码登录</button>
+                <button id="tabLoginSession" class="tab-btn" style="flex:1; padding:0.5rem; border:none; background:none; cursor:pointer; border-bottom:2px solid transparent;">上传 Session</button>
               </div>
-              <input id="loginPassword" type="password" class="input-field" placeholder="二次密码 (可选)" />
-              <label class="text-sm" style="display:flex; align-items:center; gap:0.5rem;">
-                <input id="forceSms" type="checkbox" /> 强制短信验证
-              </label>
-              <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
-                <button id="confirmLoginBtn" class="btn btn-primary flex-1">确认登录</button>
-                <button id="unlockAccount" class="btn btn-secondary flex-1 hidden">切换账号</button>
+              
+              <!-- 验证码登录 -->
+              <div id="loginCodePanel" class="login-panel">
+                <h3 style="font-size:1rem; font-weight:600; margin-bottom:0.5rem;">验证码登录</h3>
+                <input id="loginPhone" type="text" class="input-field" placeholder="手机号 (带国家码)" />
+                <div style="display:flex; gap:0.5rem;">
+                  <input id="loginCode" type="text" class="input-field" placeholder="验证码" />
+                  <button id="sendCodeBtn" class="btn btn-secondary btn-sm">发送</button>
+                </div>
+                <input id="loginPassword" type="password" class="input-field" placeholder="二次密码 (可选)" />
+                <label class="text-sm" style="display:flex; align-items:center; gap:0.5rem;">
+                  <input id="forceSms" type="checkbox" /> 强制短信验证
+                </label>
+                <div style="display:flex; gap:0.5rem; margin-top:0.5rem;">
+                  <button id="confirmLoginBtn" class="btn btn-primary flex-1">确认登录</button>
+                  <button id="unlockAccount" class="btn btn-secondary flex-1 hidden">切换账号</button>
+                </div>
+                <div id="authStatus" class="text-sm text-center mt-4"></div>
               </div>
-              <div id="authStatus" class="text-sm text-center mt-4"></div>
+              
+              <!-- Session 文件上传 -->
+              <div id="loginSessionPanel" class="login-panel" style="display:none;">
+                <h3 style="font-size:1rem; font-weight:600; margin-bottom:0.5rem;">上传 Session 文件</h3>
+                <div style="background:var(--bg-secondary); padding:0.5rem; border-radius:4px; font-size:0.75rem; margin-bottom:0.5rem; color:var(--text-muted);">
+                  <strong>提示：</strong> Session 文件必须是通过 Telegram 客户端登录后生成的 <code>.session</code> 文件。<br/>
+                  文件名应与当前选中的账号匹配（如 account_01.session）
+                </div>
+                <input type="file" id="sessionFileUpload" accept=".session" class="input-field" style="padding:0.5rem;" />
+                <button id="uploadSessionFileBtn" class="btn btn-primary" style="width:100%;">上传并验证</button>
+                
+                <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border-color);">
+                  <h4 style="font-size:0.9rem; font-weight:600; margin-bottom:0.5rem;">加入群组</h4>
+                  <textarea id="joinGroupLinks" class="textarea-field" style="height:60px; font-size:0.85rem;" placeholder="输入群组链接，每行一个&#10;支持: https://t.me/+xxx 或 @groupname"></textarea>
+                  <button id="joinGroupsBtn" class="btn btn-secondary" style="width:100%; margin-top:0.5rem;">加入群组</button>
+                </div>
+                
+                <div id="sessionStatus" class="text-sm mt-4" style="white-space:pre-line;"></div>
+              </div>
             </div>
           </div>
         </div>
@@ -93,7 +122,7 @@
                   </div>
                   <div class="input-group">
                     <label class="input-label">每条间隔 (ms)</label>
-                    <input id="delayMs" type="number" value="60000" class="input-field" />
+                    <input id="delayMs" type="number" value="11000" class="input-field" />
                   </div>
                   <div class="input-group">
                     <label class="input-label">发送轮数</label>
@@ -110,9 +139,10 @@
                     <span class="text-sm">关闭链接预览</span>
                   </label>
                 </div>
-                <div style="display:flex; gap:1rem; align-items:center;">
+                <div style="display:flex; gap:1rem; align-items:center; flex-wrap:wrap;">
                   <button id="sendBtn" class="btn btn-primary">发送到选中群组 (后台)</button>
                   <button id="testBtn" class="btn btn-secondary">测试发送</button>
+                  <button id="batchSendBtn" class="btn btn-primary" style="background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);">批量开始群发 (已授权账号)</button>
                   <div id="result" class="text-sm" style="margin-left:auto;"></div>
                 </div>
               </div>
@@ -127,6 +157,8 @@
                 <span>全局任务监控</span>
                 <div style="display:flex; gap:0.5rem;">
                   <input id="summarySearch" type="text" class="input-field" style="padding:0.25rem 0.5rem; width:100px; font-size:0.75rem;" placeholder="筛选..." />
+                  <button id="resetSystemBtn" class="btn btn-danger btn-sm">重置</button>
+                  <button id="accountManageBtn" class="btn btn-secondary btn-sm">账号管理</button>
                   <button id="checkAccountsBtn" class="btn btn-secondary btn-sm">检查账号</button>
                   <button id="summaryRefresh" class="btn btn-secondary btn-sm">刷新</button>
                 </div>
@@ -217,6 +249,112 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=3.3"></script>
+  <!-- Account Management Modal -->
+  <div id="accountManageModal" class="modal hidden">
+    <div class="modal-content" style="width: 600px; max-width: 95vw;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3 style="margin:0;">账号管理</h3>
+        <button id="closeAccountManageModal" style="background:none; border:none; font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Upload Session Files -->
+        <div style="margin-bottom:1.5rem; padding-bottom:1rem; border-bottom:1px solid var(--border-color);">
+          <h4 style="margin:0 0 0.5rem 0; font-size:0.9rem;">📁 上传 Session 文件</h4>
+          <div style="display:flex; gap:0.5rem; align-items:center;">
+            <input type="file" id="sessionFileInput" multiple accept=".session" style="flex:1;" />
+            <button id="uploadSessionBtn" class="btn btn-primary btn-sm">上传</button>
+          </div>
+          <p id="uploadStatus" class="text-sm text-muted" style="margin-top:0.5rem;"></p>
+        </div>
+        
+        <!-- Batch Join Groups -->
+        <div style="margin-bottom:1.5rem; padding-bottom:1rem; border-bottom:1px solid var(--border-color);">
+          <h4 style="margin:0 0 0.5rem 0; font-size:0.9rem;">🔗 批量加入群组</h4>
+          <textarea id="joinLinksInput" class="textarea-field" style="height:80px; font-size:0.85rem;" placeholder="输入群组邀请链接，每行一个&#10;支持格式: https://t.me/+xxx 或 https://t.me/groupname 或 @groupname"></textarea>
+          <div style="display:flex; gap:0.5rem; margin-top:0.5rem; align-items:center; flex-wrap:wrap;">
+            <select id="joinMode" class="select-field" style="width:auto;">
+              <option value="all">所有账号加入每个群</option>
+              <option value="distribute">分配账号到不同群</option>
+            </select>
+            <input type="number" id="joinDelayMs" value="3000" min="1000" style="width:80px;" class="input-field" placeholder="延迟ms" />
+            <button id="batchJoinBtn" class="btn btn-primary btn-sm">开始加入</button>
+          </div>
+          <p id="joinStatus" class="text-sm text-muted" style="margin-top:0.5rem;"></p>
+        </div>
+        
+        <!-- Account List -->
+        <div>
+          <h4 style="margin:0 0 0.5rem 0; font-size:0.9rem;">👤 已有账号 (<span id="accountCount">0</span>)</h4>
+          <div id="accountListContainer" style="max-height:150px; overflow-y:auto; border:1px solid var(--border-color); border-radius:4px; padding:0.5rem;">
+            <p class="text-muted text-sm">加载中...</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Protocol Manager Modal -->
+  <div id="protocolManagerModal" class="modal hidden">
+    <div class="modal-content" style="width: 800px; max-width: 95vw; max-height: 90vh; overflow-y: auto;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3 style="margin:0;">📱 协议号批量管理</h3>
+        <button id="closeProtocolManager" style="background:none; border:none; font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+      
+      <div class="modal-body">
+        <!-- 步骤 1: 批量上传 -->
+        <div class="protocol-section" style="margin-bottom:1.5rem; padding:1rem; border:2px solid var(--border-color); border-radius:8px;">
+          <h4 style="margin:0 0 0.75rem 0; color:var(--primary-color);">📤 步骤1: 批量上传协议号</h4>
+          <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.5rem;">
+            <input type="file" id="protocolFiles" multiple accept=".session" class="input-field" style="flex:1; padding:0.5rem;" />
+            <button id="uploadProtocolsBtn" class="btn btn-primary">上传全部</button>
+          </div>
+          <p class="text-sm text-muted" style="margin:0.5rem 0 0 0;">
+            💡 提示: 可以同时选择多个 .session 文件。文件名将作为账号名称（如 account_01.session）
+          </p>
+          <div id="uploadProgress" class="text-sm" style="margin-top:0.5rem; white-space:pre-line;"></div>
+        </div>
+        
+        <!-- 步骤 2: 验证状态 -->
+        <div class="protocol-section" style="margin-bottom:1.5rem; padding:1rem; border:2px solid var(--border-color); border-radius:8px;">
+          <h4 style="margin:0 0 0.75rem 0; color:var(--primary-color);">✅ 步骤2: 验证协议号状态</h4>
+          <button id="verifyProtocolsBtn" class="btn btn-secondary" style="width:100%;">开始验证</button>
+          <button id="assignProtocolsBtn" class="btn btn-primary" style="width:100%; margin-top:0.5rem;" disabled>全部加入账号序列</button>
+          <div id="assignProgress" class="text-sm" style="margin-top:0.5rem; white-space:pre-line;"></div>
+          <div id="verifyProgress" style="margin-top:1rem;">
+            <div id="protocolStatusList" style="max-height:200px; overflow-y:auto;"></div>
+          </div>
+        </div>
+        
+        <!-- 步骤 3: 批量加入群组 -->
+        <div class="protocol-section" style="padding:1rem; border:2px solid var(--border-color); border-radius:8px;">
+          <h4 style="margin:0 0 0.75rem 0; color:var(--primary-color);">🎯 步骤3: 批量加入群组</h4>
+          <textarea id="protocolGroupLinks" class="textarea-field" style="height:100px; font-size:0.85rem; margin-bottom:0.75rem;" placeholder="输入群组链接，每行一个&#10;支持格式:&#10;https://t.me/+xxx (私密链接)&#10;https://t.me/groupname (公开群)&#10;@groupname (用户名)"></textarea>
+          
+          <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.75rem;">
+            <label style="font-size:0.85rem;">账号间隔 (秒):</label>
+            <input type="number" id="protocolDelay" value="5" min="3" max="30" style="width:80px;" class="input-field" />
+            <label style="font-size:0.85rem;">群组间隔 (秒):</label>
+            <input type="number" id="protocolGroupDelay" value="3" min="2" max="20" style="width:80px;" class="input-field" />
+          </div>
+          
+          <button id="batchJoinProtocolBtn" class="btn btn-primary" style="width:100%; background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);">🚀 开始批量加入</button>
+          
+          <div id="joinProgress" style="margin-top:1rem;">
+            <div id="joinProgressBar" style="display:none; margin-bottom:0.5rem;">
+              <div style="background:#e0e0e0; height:20px; border-radius:10px; overflow:hidden;">
+                <div id="joinProgressFill" style="background:linear-gradient(90deg, #667eea 0%, #764ba2 100%); height:100%; width:0%; transition:width 0.3s;"></div>
+              </div>
+              <p id="joinProgressText" class="text-sm text-center" style="margin-top:0.25rem;">准备中...</p>
+            </div>
+            <div id="joinResultsList" style="max-height:250px; overflow-y:auto; font-size:0.85rem;"></div>
+          </div>
+        </div>
+        
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=4.2"></script>
 </body>
 </html>

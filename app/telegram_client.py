@@ -8,6 +8,8 @@ from telethon.tl.functions.messages import GetFullChatRequest
 from app.config import CONFIG
 import os
 import glob
+import tempfile
+import shutil
 
 
 INLINE_BOT_USERNAME = "PostBot"
@@ -24,19 +26,36 @@ class AccountClientManager:
         self.client: Optional[TelegramClient] = None
         self._connected = False
         self._auto_reply_setup = False
+        self._last_activity = 0  # 最后活动时间
+        self._lock = asyncio.Lock()  # 连接锁
 
     async def ensure_connected(self):
-        if not self._connected:
-            loop = asyncio.get_running_loop()
-            if self.client is None:
-                session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-                self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
-            await self.client.connect()
-            authorized = await self.client.is_user_authorized()
-            if not authorized:
-                raise RuntimeError("Telegram session not authorized")
-            self._connected = True
-            self._setup_auto_reply()
+        async with self._lock:
+            if not self._connected or (self.client and not self.client.is_connected()):
+                loop = asyncio.get_running_loop()
+                if self.client is None:
+                    session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
+                    self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+                if not self.client.is_connected():
+                    await self.client.connect()
+                authorized = await self.client.is_user_authorized()
+                if not authorized:
+                    raise RuntimeError("Telegram session not authorized")
+                self._connected = True
+                self._setup_auto_reply()
+            import time
+            self._last_activity = time.time()
+    
+    async def disconnect(self):
+        """断开连接以释放资源"""
+        async with self._lock:
+            if self.client and self.client.is_connected():
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+            self._connected = False
+            print(f"[CONN] {self.session_name}: disconnected to save memory")
 
     def _setup_auto_reply(self):
         if self._auto_reply_setup or not self.client:
@@ -202,11 +221,26 @@ class AccountClientManager:
         
         if not os.path.exists(session_path):
             return {"valid": False, "authorized": False, "error": "session_file_not_found"}
+        try:
+            with open(session_path, "rb") as f:
+                header = f.read(16)
+            if not header.startswith(b"SQLite format 3"):
+                return {"valid": False, "authorized": False, "error": "invalid_session_file_format"}
+        except Exception as e:
+            return {"valid": False, "authorized": False, "error": f"session_read_failed: {type(e).__name__}: {str(e)}"}
         
         loop = asyncio.get_running_loop()
         temp_client = None
+        temp_dir = None
         try:
-            temp_client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+            temp_dir = tempfile.mkdtemp(prefix="tg_session_validate_")
+            temp_session_base = os.path.join(temp_dir, self.session_name)
+            shutil.copy2(session_path, f"{temp_session_base}.session")
+            journal_src = f"{session_path}-journal"
+            if os.path.exists(journal_src):
+                shutil.copy2(journal_src, f"{temp_session_base}.session-journal")
+
+            temp_client = TelegramClient(temp_session_base, self.api_id, self.api_hash, loop=loop)
             await temp_client.connect()
             
             if not await temp_client.is_user_authorized():
@@ -228,6 +262,11 @@ class AccountClientManager:
             if temp_client:
                 try:
                     await temp_client.disconnect()
+                except Exception:
+                    pass
+            if temp_dir:
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -319,15 +358,23 @@ class AccountClientManager:
         try:
             from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
             from telethon.tl.types import ChatInviteAlready, ChatInvite
+            from telethon.tl.functions.chatlists import CheckChatlistInviteRequest, JoinChatlistInviteRequest
+            from telethon import utils
             import re
             
             # 解析邀请链接
             invite_hash = None
             username = None
+            folder_slug = None
             
             # 处理不同格式的链接
+            addlist_match = re.search(r"(?:https?://)?t\.me/addlist/([A-Za-z0-9_-]+)", invite_link)
+            if addlist_match:
+                folder_slug = addlist_match.group(1)
             if invite_link.startswith("@"):
                 username = invite_link[1:]
+            elif "t.me/addlist/" in invite_link:
+                folder_slug = invite_link.split("t.me/addlist/")[-1].split("?")[0].split("/")[0]
             elif "t.me/+" in invite_link:
                 # https://t.me/+xxxxx
                 invite_hash = invite_link.split("+")[-1].split("?")[0]
@@ -343,6 +390,52 @@ class AccountClientManager:
                     username = invite_link
                 else:
                     invite_hash = invite_link
+
+            if folder_slug:
+                try:
+                    chatlist = await self.client(CheckChatlistInviteRequest(slug=folder_slug))
+                    raw_peers = []
+                    invite_already = False
+                    if hasattr(chatlist, "peers"):
+                        raw_peers = chatlist.peers
+                    elif hasattr(chatlist, "missing_peers"):
+                        raw_peers = chatlist.missing_peers
+                        invite_already = True
+
+                    chats_by_id = {getattr(c, "id", None): c for c in (getattr(chatlist, "chats", []) or [])}
+
+                    peers_to_join = []
+                    for peer in raw_peers or []:
+                        peer_id = None
+                        if hasattr(peer, "channel_id"):
+                            peer_id = peer.channel_id
+                        elif hasattr(peer, "chat_id"):
+                            peer_id = peer.chat_id
+                        if peer_id is None:
+                            continue
+                        entity = chats_by_id.get(peer_id)
+                        if not entity:
+                            continue
+                        try:
+                            peers_to_join.append(utils.get_input_peer(entity))
+                        except Exception:
+                            continue
+
+                    if not peers_to_join:
+                        if invite_already:
+                            return {"ok": True, "already_joined": True}
+                        return {"ok": False, "error": "folder_empty_or_no_joinable_peers"}
+
+                    chunk_size = 50
+                    joined = 0
+                    for i in range(0, len(peers_to_join), chunk_size):
+                        chunk = peers_to_join[i:i + chunk_size]
+                        await self.client(JoinChatlistInviteRequest(slug=folder_slug, peers=chunk))
+                        joined += len(chunk)
+
+                    return {"ok": True, "joined_count": joined}
+                except Exception as e:
+                    return {"ok": False, "error": f"join_folder_failed: {e}"}
             
             if username:
                 # 公开群组，直接通过 username 加入
@@ -418,15 +511,18 @@ class AccountClientManager:
 
 
 class MultiTelegramManager:
+    MAX_CONCURRENT_CONNECTIONS = 5  # 最大同时连接数
+    IDLE_TIMEOUT = 300  # 5 分钟空闲后断开
+    
     def __init__(self, accounts: dict):
         self.managers: dict[str, AccountClientManager] = {}
         for name, cfg in accounts.items():
             self.managers[name] = AccountClientManager(cfg["session_name"], cfg["api_id"], cfg["api_hash"])
+        self._cleanup_task = None
 
     def get(self, account: str) -> AccountClientManager:
         if account not in self.managers:
             # Dynamically create a manager for the account if it doesn't exist.
-            # This assumes a standard naming convention for session files.
             session_name = account
             api_id = int(CONFIG.TG_API_ID) if CONFIG.TG_API_ID is not None else None
             api_hash = CONFIG.TG_API_HASH
@@ -436,7 +532,36 @@ class MultiTelegramManager:
         return self.managers[account]
 
     async def ensure_connected(self, account: str):
+        # 先检查是否需要断开其他空闲连接
+        await self._cleanup_idle_connections()
         await self.get(account).ensure_connected()
+    
+    async def _cleanup_idle_connections(self):
+        """清理空闲连接以控制内存使用"""
+        import time
+        current_time = time.time()
+        connected_count = 0
+        idle_managers = []
+        
+        for name, mgr in self.managers.items():
+            if mgr._connected and mgr.client and mgr.client.is_connected():
+                connected_count += 1
+                # 超过空闲时间的连接
+                if current_time - mgr._last_activity > self.IDLE_TIMEOUT:
+                    idle_managers.append(mgr)
+        
+        # 如果连接数超过限制，断开最旧的空闲连接
+        if connected_count >= self.MAX_CONCURRENT_CONNECTIONS and idle_managers:
+            # 按最后活动时间排序，断开最旧的
+            idle_managers.sort(key=lambda m: m._last_activity)
+            for mgr in idle_managers[:max(1, connected_count - self.MAX_CONCURRENT_CONNECTIONS + 1)]:
+                await mgr.disconnect()
+    
+    async def disconnect_all(self):
+        """断开所有连接"""
+        for mgr in self.managers.values():
+            await mgr.disconnect()
+        print("[CONN] All connections closed")
 
     async def get_joined_groups(self, account: str, only_groups: bool = True) -> List[dict]:
         return await self.get(account).get_joined_groups(only_groups=only_groups)
@@ -466,15 +591,16 @@ multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)
 
 
 async def setup_auto_reply_for_all_sessions():
+    """
+    不再在启动时连接所有账号！
+    连接会在需要时懒加载，auto-reply 在连接时自动设置。
+    这样可以大大减少内存使用。
+    """
     session_dir = CONFIG.SESSION_DIR
     if not os.path.isdir(session_dir):
         return
     pattern = os.path.join(session_dir, "*.session")
-    for path in glob.glob(pattern):
-        name = os.path.basename(path).rsplit(".", 1)[0]
-        try:
-            mgr = multi_manager.get(name)
-            await mgr._ensure_client()
-            print(f"[INFO] Auto-reply startup check for {name}, setup={mgr._auto_reply_setup}")
-        except Exception as e:
-            print(f"[ERROR] Auto-reply startup failed for {name}: {e}")
+    session_count = len(glob.glob(pattern))
+    print(f"[INFO] Found {session_count} session files. Connections will be made lazily on demand.")
+    print(f"[INFO] Max concurrent connections: {MultiTelegramManager.MAX_CONCURRENT_CONNECTIONS}")
+    print(f"[INFO] Idle timeout: {MultiTelegramManager.IDLE_TIMEOUT}s")
