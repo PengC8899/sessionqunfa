@@ -73,15 +73,14 @@ class AccountClientManager:
         @self.client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
         async def handler(event):
             try:
-                # Avoid replying to self
                 if event.sender_id == (await self.client.get_me()).id:
                     return
-                
-                # Send text reply
                 reply_text = os.getenv("AUTO_REPLY_TEXT", "hello")
+                if reply_text is None:
+                    reply_text = "hello"
+                reply_text = reply_text.replace("\\n", "\n")
                 await event.reply(reply_text, parse_mode=None, link_preview=False)
                 print(f"[INFO] Auto-replied '{reply_text}' to {event.sender_id} on account {self.session_name}")
-                    
             except Exception as e:
                 print(f"[ERROR] Auto-reply failed: {e}")
 
