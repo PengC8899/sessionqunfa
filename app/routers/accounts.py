@@ -33,5 +33,5 @@ async def delete_account(request: Request):
     except:
          return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
 
-    deleted = account_service.delete_session(account)
+    deleted = await account_service.delete_session(account)
     return JSONResponse({"account": account, "deleted": deleted})

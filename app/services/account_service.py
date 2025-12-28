@@ -135,7 +135,7 @@ class AccountService:
         results = await asyncio.gather(*tasks)
         return results
 
-    def delete_session(self, session_name: str):
+    async def delete_session(self, session_name: str):
         session_base = os.path.join(CONFIG.SESSION_DIR, session_name)
         deleted = False
         for ext in [".session", ".session-journal"]:

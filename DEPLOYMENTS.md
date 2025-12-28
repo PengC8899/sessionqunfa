@@ -2,46 +2,6 @@
 
 本文档用于记录 `qunfa` 脚本的 VPS 部署信息，以便维护和调试。
 
-## 1. 初始 VPS (Singapore)
-- **IP 地址**: `47.130.222.65`
-- **SSH 用户**: `ubuntu`
-- **密钥文件**: `/Users/pclucky/qunfa/xinjiapo.pem`
-- **部署路径**: `~/qunfa`
-- **配置概览**:
-  - `ACCOUNT_COUNT`: 100
-- **状态**: 🟢 正常运行
-- **最近维护**:
-  - 修复前端登录输入框无法输入的问题
-  - 修复令牌保存按钮逻辑
-  - 优化数据库连接池配置 (解决 `QueuePool limit` 报错)
-  - 更新 API ID/Hash
-  - **更新**: 自动回复文案 (High-Volume Corporate Accounts)
-  - **功能**: 实现随机群组发送顺序 (防止多账号同步并发)
-  - **修复**: `/api/send-async-batch` 冷却时间计算的时区错误 (避免 500 / 卡死)
-  - **稳定性**: 增加 `1G swap`（`/swapfile`）防止内存峰值导致 SSH 断连
-
-## 2. 孟买 VPS (Mengmai)
-- **IP 地址**: `13.203.174.210`
-- **SSH 用户**: `ubuntu`
-- **密钥文件**: `/Users/pclucky/qunfa/mengmai.pem`
-- **部署路径**: `~/qunfa`
-- **配置概览**:
-  - `ADMIN_TOKEN`: `123456`
-  - `ACCOUNT_COUNT`: 100
-  - `TG_API_ID`: `24426543`
-- **状态**: 🟢 正常运行
-- **最近维护**:
-  - 全新部署环境 (Docker + Docker Compose)
-  - 修复环境变量不生效问题 (Recreated container)
-  - 手动创建并授权 `sessions` 目录
-  - 优化数据库并发
-  - **更新**: 自动回复文案同步
-  - **功能**: 随机群发顺序同步
-  - **修复**: `/api/send-async-batch` 冷却时间计算的时区错误 (避免 500 / 卡死)
-  - **稳定性**: 增加 `1G swap`（`/swapfile`）防止内存峰值导致 SSH 断连
-
-
-
 ## 5. 备用配置 (Backup Config)
 ### 备用 Telegram API Credentials
 如果主 API (24426543) 失效或被封禁，可切换使用以下备用 API：
@@ -52,18 +12,6 @@
 ---
 
 ## 常用维护命令
-
-### 连接服务器
-```bash
-# 连接初始 VPS (新加坡)
-ssh -i xinjiapo.pem ubuntu@47.130.222.65
-
-# 连接孟买 VPS
-ssh -i mengmai.pem ubuntu@13.203.174.210
-
-
-```
-
 ### 重启服务
 ```bash
 cd qunfa
