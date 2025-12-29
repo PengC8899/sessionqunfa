@@ -11,6 +11,7 @@ const state = {
   summaryFiltered: [],
   summarySortKey: 'account',
   summarySortAsc: true,
+  authorizedAccounts: [],
 };
 
 function loadToken() {
@@ -852,6 +853,7 @@ function setupAccountManage() {
   const closeBtn = document.getElementById('closeAccountManageModal');
   const uploadBtn = document.getElementById('uploadSessionBtn');
   const batchJoinBtn = document.getElementById('batchJoinBtn');
+  const openCleanupBtn = document.getElementById('openAuthorizedCleanup');
   
   if (!modal || !openBtn) return;
   
@@ -866,6 +868,126 @@ function setupAccountManage() {
   
   uploadBtn.addEventListener('click', uploadSessionFiles);
   batchJoinBtn?.addEventListener('click', batchJoinGroups);
+
+  if (openCleanupBtn) {
+    openCleanupBtn.addEventListener('click', () => {
+      const cleanupModal = document.getElementById('authorizedCleanupModal');
+      if (cleanupModal) {
+        cleanupModal.classList.remove('hidden');
+        loadAuthorizedAccounts();
+      }
+    });
+  }
+}
+
+async function loadAuthorizedAccounts() {
+  const container = document.getElementById('authorizedAccountsContainer');
+  const summaryEl = document.getElementById('authorizedAccountsSummary');
+  if (!container) return;
+  container.innerHTML = '<p class="text-muted text-sm" style="padding:0.5rem;">加载中...</p>';
+  if (summaryEl) summaryEl.textContent = '';
+  try {
+    const res = await fetch('/api/accounts/authorized-list', { headers: { 'X-Admin-Token': state.token } });
+    if (!res.ok) {
+      container.innerHTML = '<p class="text-danger text-sm" style="padding:0.5rem;">加载失败</p>';
+      return;
+    }
+    const data = await res.json();
+    state.authorizedAccounts = Array.isArray(data) ? data : [];
+    renderAuthorizedAccounts();
+  } catch (e) {
+    container.innerHTML = `<p class="text-danger text-sm" style="padding:0.5rem;">加载失败: ${e.message}</p>`;
+  }
+}
+
+function renderAuthorizedAccounts() {
+  const container = document.getElementById('authorizedAccountsContainer');
+  const summaryEl = document.getElementById('authorizedAccountsSummary');
+  if (!container) return;
+  const list = state.authorizedAccounts || [];
+  if (!list.length) {
+    container.innerHTML = '<p class="text-muted text-sm" style="padding:0.5rem;">当前没有已授权账号</p>';
+    if (summaryEl) summaryEl.textContent = '';
+    return;
+  }
+  let html = '<table style="width:100%; border-collapse:collapse; font-size:0.85rem;"><thead><tr><th style="text-align:left; padding:0.5rem;">账号</th><th style="text-align:left; padding:0.5rem;">状态</th><th style="text-align:right; padding:0.5rem;">操作</th></tr></thead><tbody>';
+  list.forEach(item => {
+    const statusText = item.has_running_tasks ? '运行中' : (item.authorized ? '已授权' : '未授权');
+    const statusClass = item.has_running_tasks ? 'status-warning' : (item.authorized ? 'status-success' : 'text-muted');
+    const extra = item.running_tasks ? ` (${item.running_tasks} 个任务)` : '';
+    html += `<tr data-account="${item.account}">
+      <td style="padding:0.5rem;">${item.account}</td>
+      <td style="padding:0.5rem;" class="${statusClass}">${statusText}${extra}</td>
+      <td style="padding:0.5rem; text-align:right;">
+        <button class="btn btn-danger btn-sm authorized-delete-btn" data-account="${item.account}">删除</button>
+      </td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
+  if (summaryEl) summaryEl.textContent = `共 ${list.length} 个账号`;
+  const deleteButtons = container.querySelectorAll('.authorized-delete-btn');
+  deleteButtons.forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const acc = e.currentTarget.getAttribute('data-account');
+      await deleteAuthorizedAccount(acc);
+    });
+  });
+}
+
+async function deleteAuthorizedAccount(account) {
+  if (!account) return;
+  if (!confirm(`确定要删除账号 ${account} 的会话吗？运行中的任务将被停止，此操作不可恢复。`)) return;
+  try {
+    const res = await fetch('/api/accounts/bulk-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+      body: JSON.stringify({ accounts: [account] }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(`删除失败: ${data.detail || '未知错误'}`);
+    } else {
+      const result = Array.isArray(data.results) && data.results[0] ? data.results[0] : null;
+      if (!result || !result.deleted) {
+        const msg = (result && result.error) || data.detail || '删除失败';
+        alert(msg);
+      }
+    }
+  } catch (e) {
+    alert(`删除失败: ${e.message}`);
+  }
+  await loadAuthorizedAccounts();
+  await fetchAccounts();
+  await fetchAuthStatus();
+}
+
+async function deleteAllAuthorizedAccounts() {
+  const list = state.authorizedAccounts || [];
+  if (!list.length) {
+    alert('当前没有可删除的账号');
+    return;
+  }
+  if (!confirm('确定要清空所有已授权账号吗？所有对应会话将被删除，运行中的任务会被停止，此操作不可恢复。')) return;
+  const names = list.map(x => x.account).filter(Boolean);
+  try {
+    const res = await fetch('/api/accounts/bulk-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+      body: JSON.stringify({ accounts: names }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(`清空失败: ${data.detail || '未知错误'}`);
+    } else {
+      alert('清空完成');
+    }
+  } catch (e) {
+    alert(`清空失败: ${e.message}`);
+  }
+  await loadAuthorizedAccounts();
+  await fetchAccounts();
+  await fetchAuthStatus();
 }
 
 async function loadAccountList() {
@@ -1162,6 +1284,20 @@ document.addEventListener('DOMContentLoaded', () => {
   setupLoginTabs();
   setupSessionUpload();
   setupProtocolManager();
+  const closeAuthorizedModal = document.getElementById('closeAuthorizedCleanupModal');
+  const authorizedModal = document.getElementById('authorizedCleanupModal');
+  const deleteAllAuthorizedBtn = document.getElementById('deleteAllAuthorizedBtn');
+  if (closeAuthorizedModal && authorizedModal) {
+    closeAuthorizedModal.addEventListener('click', () => {
+      authorizedModal.classList.add('hidden');
+    });
+    authorizedModal.addEventListener('click', (e) => {
+      if (e.target === authorizedModal) authorizedModal.classList.add('hidden');
+    });
+  }
+  if (deleteAllAuthorizedBtn) {
+    deleteAllAuthorizedBtn.addEventListener('click', deleteAllAuthorizedAccounts);
+  }
 });
 
 // ========== Login Tabs ==========

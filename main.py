@@ -84,6 +84,53 @@ async def list_accounts_status(request: Request):
         data.append({"account": name, "authorized": authorized})
     return JSONResponse(data)
 
+
+@app.route("/api/accounts/authorized-list")
+async def list_authorized_accounts(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    session_dir = CONFIG.SESSION_DIR
+    db: Session = SessionLocal()
+    running_counts: dict[str, int] = {}
+    try:
+        rows = db.query(Task).filter(Task.status == "running").all()
+        for t in rows:
+            name = (t.account_name or "").strip()
+            if not name:
+                continue
+            running_counts[name] = running_counts.get(name, 0) + 1
+    finally:
+        db.close()
+    names = _discover_session_accounts()
+    data: list[dict] = []
+    seen = set()
+    for name in names:
+        seen.add(name)
+        session_path = os.path.join(session_dir, f"{name}.session")
+        authorized = os.path.exists(session_path)
+        cnt = int(running_counts.get(name, 0))
+        data.append(
+            {
+                "account": name,
+                "authorized": bool(authorized),
+                "running_tasks": cnt,
+                "has_running_tasks": cnt > 0,
+            }
+        )
+    for name, cnt in running_counts.items():
+        if name in seen:
+            continue
+        data.append(
+            {
+                "account": name,
+                "authorized": False,
+                "running_tasks": int(cnt),
+                "has_running_tasks": True,
+            }
+        )
+    return JSONResponse(data)
+
 app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
 app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
 app.add_route("/api/system/reset", reset_system, methods=["POST"])
@@ -152,6 +199,75 @@ async def upload_sessions(request: Request):
         "validated_accounts": validated_accounts,
         "errors": errors if errors else None
     })
+
+
+@app.route("/api/accounts/bulk-delete", methods=["POST"])
+async def bulk_delete_accounts(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    accounts = body.get("accounts") or []
+    if not isinstance(accounts, list):
+        return JSONResponse({"detail": "accounts must be a list"}, status_code=400)
+    cleaned: list[str] = []
+    for a in accounts:
+        if not isinstance(a, str):
+            a = str(a)
+        name = a.strip()
+        if name and name not in cleaned:
+            cleaned.append(name)
+    if not cleaned:
+        return JSONResponse({"detail": "no_accounts"}, status_code=400)
+    db: Session = SessionLocal()
+    results = []
+    try:
+        for name in cleaned:
+            stopped = 0
+            try:
+                rows = db.query(Task).filter(Task.account_name == name, Task.status == "running").all()
+                for t in rows:
+                    t.stop_requested = 1
+                    t.status = "stopped"
+                    t.finished_at = CONFIG.now()
+                    db.add(
+                        TaskEvent(
+                            task_id=t.id,
+                            event="account_deleted",
+                            detail="account_session_deleted_by_admin",
+                            meta_json=json.dumps({"account": name}, ensure_ascii=False),
+                        )
+                    )
+                if rows:
+                    db.commit()
+                stopped = len(rows)
+            except Exception:
+                db.rollback()
+            deleted = False
+            error = None
+            try:
+                if name in multi_manager.managers:
+                    try:
+                        await multi_manager.managers[name].disconnect()
+                    except Exception:
+                        pass
+                deleted = await account_service.delete_session(name)
+            except Exception as e:
+                error = str(e)[:200]
+            results.append(
+                {
+                    "account": name,
+                    "deleted": bool(deleted),
+                    "tasks_stopped": stopped,
+                    "error": error,
+                }
+            )
+        return JSONResponse({"results": results})
+    finally:
+        db.close()
 
 @app.route("/api/accounts/assign-sequence", methods=["POST"])
 async def assign_sequence(request: Request):
@@ -803,26 +919,17 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         t.failed = (t.failed or 0) + 1
                         consecutive_failures += 1  # 失败则增加计数器
                         
-                        # 检查是否达到连续失败上限
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            print(f"[AUTO-STOP] {account}: {consecutive_failures} consecutive failures, stopping task and clearing session")
+                            print(f"[AUTO-STOP] {account}: {consecutive_failures} consecutive failures, stopping task")
                             t.status = "error"
                             t.finished_at = CONFIG.now()
                             db.add(TaskEvent(
                                 task_id=task_id, 
                                 event="auto_stopped", 
-                                detail=f"连续失败{consecutive_failures}次，自动停止并清除登录信息",
+                                detail=f"连续失败{consecutive_failures}次，自动停止任务",
                                 meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
                             ))
                             db.commit()
-                            
-                            # 清除该账号的 session 文件
-                            try:
-                                await account_service.delete_session(account)
-                                print(f"[AUTO-STOP] {account}: session deleted")
-                            except Exception as del_err:
-                                print(f"[AUTO-STOP] {account}: failed to delete session: {del_err}")
-                            
                             return  # 停止任务
                             
                     t.current_index = (t.current_index or 0) + 1

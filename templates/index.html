@@ -288,6 +288,29 @@
           <div id="accountListContainer" style="max-height:150px; overflow-y:auto; border:1px solid var(--border-color); border-radius:4px; padding:0.5rem;">
             <p class="text-muted text-sm">加载中...</p>
           </div>
+          <div style="margin-top:1rem; text-align:right;">
+            <button id="openAuthorizedCleanup" class="btn btn-danger btn-sm">清空所有已授权账号</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Authorized Accounts Cleanup Modal -->
+  <div id="authorizedCleanupModal" class="modal hidden">
+    <div class="modal-content" style="width: 600px; max-width: 95vw;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;">
+        <h3 style="margin:0;">清空已授权账号</h3>
+        <button id="closeAuthorizedCleanupModal" style="background:none; border:none; font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-muted" style="margin-bottom:0.75rem;">列出所有当前存在会话文件或正在运行任务的账号，可以单独删除，也可以一键清空。</p>
+        <div id="authorizedAccountsContainer" class="table-container" style="max-height:300px; overflow-y:auto; border:1px solid var(--border-color); border-radius:4px;">
+          <p class="text-muted text-sm" style="padding:0.5rem;">加载中...</p>
+        </div>
+        <div style="margin-top:1rem; display:flex; justify-content:space-between; align-items:center;">
+          <span id="authorizedAccountsSummary" class="text-sm text-muted"></span>
+          <button id="deleteAllAuthorizedBtn" class="btn btn-danger btn-sm">清空所有已授权账号</button>
         </div>
       </div>
     </div>
