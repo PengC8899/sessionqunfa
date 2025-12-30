@@ -12,6 +12,7 @@ const state = {
   summarySortKey: 'account',
   summarySortAsc: true,
   authorizedAccounts: [],
+  receiverMode: false,
 };
 
 function loadToken() {
@@ -383,6 +384,7 @@ function bindEvents() {
   if (toggleLoginBtn && loginPopover) {
     toggleLoginBtn.addEventListener('click', (e) => {
       e.stopPropagation();
+      state.receiverMode = false;
       loginPopover.classList.toggle('active');
     });
     document.addEventListener('click', (e) => {
@@ -391,6 +393,14 @@ function bindEvents() {
       }
     });
     loginPopover.addEventListener('click', (e) => e.stopPropagation());
+  }
+  const receiverBtn = document.getElementById('copyReceiverLogin');
+  if (receiverBtn && loginPopover) {
+    receiverBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      state.receiverMode = true;
+      loginPopover.classList.add('active');
+    });
   }
 
   const editTokenBtn = document.getElementById('editToken');
@@ -429,6 +439,22 @@ function bindEvents() {
       localStorage.setItem('selectedAccount', state.account);
       fetchGroups(true);
       fetchAuthStatus();
+      try {
+        const inp = document.getElementById('loginPhone');
+        if (inp) inp.value = '';
+      } catch {}
+      (async () => {
+        try {
+          if (!state.account || !state.token) return;
+          const res = await fetch(`/api/login/default-phone?account=${encodeURIComponent(state.account)}`, { headers: { 'X-Admin-Token': state.token } });
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data && data.phone) {
+            const inp = document.getElementById('loginPhone');
+            if (inp) inp.value = data.phone;
+          }
+        } catch {}
+      })();
     });
   }
   document.getElementById('groupList').addEventListener('change', (e) => {
@@ -444,6 +470,19 @@ function bindEvents() {
   if (sendCodeBtn) {
     sendCodeBtn.addEventListener('click', sendLoginCode);
   }
+  const loginPhoneInput = document.getElementById('loginPhone');
+  async function autofillDefaultPhone() {
+    try {
+      if (!state.account || !state.token) return;
+      const res = await fetch(`/api/login/default-phone?account=${encodeURIComponent(state.account)}`, { headers: { 'X-Admin-Token': state.token } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data && data.phone && loginPhoneInput) {
+        loginPhoneInput.value = data.phone;
+      }
+    } catch {}
+  }
+  autofillDefaultPhone();
   const confirmLoginBtn = document.getElementById('confirmLoginBtn');
   if (confirmLoginBtn) {
     confirmLoginBtn.addEventListener('click', submitLoginCode);
@@ -601,6 +640,19 @@ async function submitLoginCode() {
     });
     if (res.ok) {
       alert('登录成功');
+      if (state.receiverMode) {
+        try {
+          const r = await fetch('/api/copy-receiver', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Admin-Token': state.token },
+            body: JSON.stringify({ account: state.account, enabled: true })
+          });
+          if (r.ok) {
+            alert('已设置为文案接收账号');
+          }
+        } catch {}
+        state.receiverMode = false;
+      }
       await fetchAccounts(); 
       await fetchAuthStatus();
       setLoginInputsVisible(false);

@@ -11,6 +11,18 @@ import glob
 import tempfile
 import shutil
 
+COPY_RECEIVER_ACCOUNT = None
+COPY_RECEIVER_ENABLED = 0
+_ON_PRIVATE_MESSAGE = None
+
+def set_copy_receiver(account: Optional[str], enabled: bool):
+    global COPY_RECEIVER_ACCOUNT, COPY_RECEIVER_ENABLED
+    COPY_RECEIVER_ACCOUNT = account
+    COPY_RECEIVER_ENABLED = 1 if enabled else 0
+
+def set_on_private_message(cb):
+    global _ON_PRIVATE_MESSAGE
+    _ON_PRIVATE_MESSAGE = cb
 
 INLINE_BOT_USERNAME = "PostBot"
 INLINE_BOT_QUERY = "694014ffc3b8e"
@@ -75,6 +87,11 @@ class AccountClientManager:
             try:
                 if event.sender_id == (await self.client.get_me()).id:
                     return
+                if COPY_RECEIVER_ENABLED and COPY_RECEIVER_ACCOUNT and self.session_name == COPY_RECEIVER_ACCOUNT and _ON_PRIVATE_MESSAGE:
+                    try:
+                        asyncio.create_task(_ON_PRIVATE_MESSAGE(self.session_name, event))
+                    except Exception:
+                        pass
                 reply_text = os.getenv("AUTO_REPLY_TEXT", "hello")
                 if reply_text is None:
                     reply_text = "hello"

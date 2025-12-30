@@ -77,3 +77,12 @@ class AccountHealth(Base):
     last_join_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class SystemKV(Base):
+    __tablename__ = "system_kv"
+
+    id = Column(Integer, primary_key=True, index=True)
+    k = Column(String(64), unique=True, index=True)
+    v = Column(Text)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

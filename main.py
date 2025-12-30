@@ -7,15 +7,16 @@ from starlette.requests import Request
 from app.config import CONFIG
 from app.database import Base, engine, SessionLocal
 from sqlalchemy import text
-from app.telegram_client import multi_manager
+from app.telegram_client import multi_manager, set_copy_receiver, set_on_private_message
 from sqlalchemy.orm import Session
-from app.models import SendLog, Task, TaskEvent
+from app.models import SendLog, Task, TaskEvent, SystemKV
 from app.services.send_service import send_to_groups
 from app.services.group_service import get_groups, clear_group_cache
 # from app.services.multi_account_sender import get_multi_sender  # 暂不使用
 from app.routers.accounts import check_single_account, delete_account
 from app.routers.system import reset_system
 from app.services.account_service import account_service
+from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate
 import json
 import time
 import uuid
@@ -24,6 +25,7 @@ import os
 import random
 import logging
 from datetime import datetime, timedelta
+import tempfile
 
 app = Starlette()
 
@@ -635,7 +637,6 @@ async def startup_event():
         pass
     try:
         import os as _os
-        import shutil as _shutil
         _os.makedirs(CONFIG.SESSION_DIR, exist_ok=True)
         for _name, _cfg in CONFIG.ACCOUNTS.items():
             _sn = _cfg.get("session_name")
@@ -649,6 +650,28 @@ async def startup_event():
                         _shutil.copy2(_src, _target)
                     except Exception:
                         pass
+    except Exception:
+        pass
+    try:
+        db: Session = SessionLocal()
+        try:
+            row = db.query(SystemKV).filter(SystemKV.k == "copy_receiver").first()
+            if row and row.v:
+                try:
+                    d = json.loads(row.v)
+                    acc = d.get("account")
+                    enabled = bool(d.get("enabled", 0))
+                    if acc:
+                        set_copy_receiver(acc, enabled)
+                except Exception:
+                    pass
+            dp = db.query(SystemKV).filter(SystemKV.k == "login_phone:main_account").first()
+            if not dp:
+                dp = SystemKV(k="login_phone:main_account", v=json.dumps({"phone": "+1 548 520 7895"}, ensure_ascii=False))
+                db.add(dp)
+                db.commit()
+        finally:
+            db.close()
     except Exception:
         pass
 
@@ -711,6 +734,106 @@ app.add_event_handler("startup", startup_event)
 
 TASKS: dict[str, dict] = {}
 
+LAST_COPY_MESSAGE: dict = {}
+
+
+async def _handle_private_copy(account: str, event):
+    try:
+        msg_id = event.message.id
+        chat_id = event.message.chat_id
+        text = getattr(event.message, "message", "") or ""
+        media_path = None
+        if getattr(event.message, "media", None):
+            tmp = tempfile.NamedTemporaryFile(delete=False)
+            try:
+                await event.message.download_media(file=tmp.name)
+                media_path = tmp.name
+            finally:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+        session = SessionLocal()
+        try:
+            LAST_COPY_MESSAGE["account"] = account
+            LAST_COPY_MESSAGE["chat_id"] = chat_id
+            LAST_COPY_MESSAGE["message_id"] = msg_id
+        finally:
+            session.close()
+        accounts = list(CONFIG.ACCOUNTS.keys())
+        authorized = []
+        for acc in accounts:
+            try:
+                ok = await multi_manager.is_authorized(acc)
+            except Exception:
+                ok = False
+            if ok:
+                authorized.append(acc)
+        for acc in authorized:
+            try:
+                gids = []
+                try:
+                    groups = await multi_manager.get_joined_groups(acc, only_groups=True)
+                    for g in groups:
+                        gid = g.get("id")
+                        if gid:
+                            gids.append(gid)
+                except Exception:
+                    pass
+                base = int(getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
+                jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
+                db = SessionLocal()
+                try:
+                    for gid in gids:
+                        ok = False
+                        err = None
+                        mid = None
+                        try:
+                            await multi_manager.ensure_connected(acc)
+                            if media_path:
+                                msg = await multi_manager.get(acc).client.send_file(entity=gid, file=media_path, caption=text)
+                                mid = getattr(msg, "id", None)
+                                ok = True
+                            else:
+                                ok, err, mid = await multi_manager.send_message_to_group(acc, gid, text=text, parse_mode=None, disable_web_page_preview=True)
+                        except Exception as e:
+                            err = str(e)
+                            ok = False
+                        title = str(gid)
+                        try:
+                            ent = await multi_manager.get(acc).client.get_entity(gid)
+                            title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
+                        except Exception:
+                            title = str(gid)
+                        db.add(SendLog(
+                            account_name=acc,
+                            group_id=gid,
+                            group_title=title,
+                            message_preview=(text or "")[:200],
+                            status="success" if ok else "failed",
+                            error=None if ok else err,
+                            message_id=mid,
+                            parse_mode=None,
+                        ))
+                        db.commit()
+                        jitter = random.uniform(-jitter_pct, jitter_pct) * base
+                        wait_ms = max(0, base + jitter)
+                        await asyncio.sleep(wait_ms / 1000.0)
+                finally:
+                    db.close()
+            except Exception:
+                pass
+        if media_path:
+            try:
+                os.unlink(media_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+set_on_private_message(_handle_private_copy)
+
 
 @app.route("/api/send-async", methods=["POST"])
 async def send_async(request: Request):
@@ -768,6 +891,63 @@ async def send_async(request: Request):
     return JSONResponse({"task_id": task_id})
 
 
+@app.route("/api/copy-receiver", methods=["POST"])
+async def set_copy_receiver_account(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    account = body.get("account")
+    enabled = bool(body.get("enabled", True))
+    if not account:
+        set_copy_receiver(None, False)
+        try:
+            db: Session = SessionLocal()
+            try:
+                row = db.query(SystemKV).filter(SystemKV.k == "copy_receiver").first()
+                if not row:
+                    row = SystemKV(k="copy_receiver", v=json.dumps({"account": None, "enabled": 0}, ensure_ascii=False))
+                    db.add(row)
+                else:
+                    row.v = json.dumps({"account": None, "enabled": 0}, ensure_ascii=False)
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+        return JSONResponse({"ok": True, "enabled": False})
+    set_copy_receiver(account, enabled)
+    try:
+        db: Session = SessionLocal()
+        try:
+            row = db.query(SystemKV).filter(SystemKV.k == "copy_receiver").first()
+            payload = {"account": account, "enabled": 1 if enabled else 0}
+            if not row:
+                row = SystemKV(k="copy_receiver", v=json.dumps(payload, ensure_ascii=False))
+                db.add(row)
+            else:
+                row.v = json.dumps(payload, ensure_ascii=False)
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        pass
+    return JSONResponse({"ok": True, "enabled": enabled, "account": account})
+
+
+@app.route("/api/copy-latest")
+async def get_copy_latest(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    data = {
+        "account": LAST_COPY_MESSAGE.get("account"),
+        "chat_id": LAST_COPY_MESSAGE.get("chat_id"),
+        "message_id": LAST_COPY_MESSAGE.get("message_id"),
+    }
+    return JSONResponse(data)
+
+
 @app.route("/api/task-status")
 async def task_status(request: Request):
     token = request.headers.get("X-Admin-Token")
@@ -806,7 +986,7 @@ async def tasks_summary(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     db: Session = SessionLocal()
     try:
-        rows = db.query(Task).filter(Task.status == "running").all()
+        rows = db.query(Task).filter(Task.status.in_(["running", "error"])).all()
         acc_map: dict[str, dict] = {}
         for t in rows:
             k = t.account_name
@@ -829,6 +1009,64 @@ async def tasks_summary(request: Request):
                 e["last_updated_at"] = e["last_updated_at"].isoformat()
             data.append(e)
         return JSONResponse(data)
+    finally:
+        db.close()
+
+@app.route("/api/tasks")
+async def list_tasks(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    db: Session = SessionLocal()
+    try:
+        rows = db.query(Task).order_by(Task.started_at.desc()).limit(100).all()
+        data = [
+            {
+                "task_id": r.id,
+                "status": r.status,
+                "total": r.total,
+                "success": r.success,
+                "failed": r.failed,
+                "current_index": r.current_index,
+                "account": r.account_name,
+                "started_at": r.started_at.isoformat() if r.started_at else None,
+                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                "rounds": getattr(r, "rounds", None),
+                "current_round": getattr(r, "current_round", None),
+                "next_round_at": r.next_round_at.isoformat() if getattr(r, "next_round_at", None) else None,
+            }
+            for r in rows
+        ]
+        return JSONResponse(data)
+    finally:
+        db.close()
+
+@app.route("/api/task-events")
+async def task_events(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    task_id = request.query_params.get("task_id")
+    page = int(request.query_params.get("page", 1))
+    size = int(request.query_params.get("size", 50))
+    if not task_id:
+        return JSONResponse({"detail": "task_id required"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        q = db.query(TaskEvent).filter(TaskEvent.task_id == task_id).order_by(TaskEvent.ts.desc())
+        rows = q.offset((page - 1) * size).limit(size).all()
+        data = [
+            {
+                "id": r.id,
+                "task_id": r.task_id,
+                "ts": r.ts.isoformat() if r.ts else None,
+                "event": r.event,
+                "detail": r.detail,
+                "meta_json": r.meta_json,
+            }
+            for r in rows
+        ]
+        return JSONResponse({"page": page, "size": size, "items": data})
     finally:
         db.close()
 
@@ -855,8 +1093,8 @@ async def _run_send_task_with_delay(
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int):
     db: Session = SessionLocal()
-    consecutive_failures = 0  # 连续失败计数器
-    MAX_CONSECUTIVE_FAILURES = 10  # 最大连续失败次数
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = int(getattr(CONFIG, "MAX_CONSECUTIVE_FAILURES", 10))
     
     try:
         for i in range(rounds):
@@ -864,12 +1102,16 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             t = db.query(Task).filter(Task.id == task_id).first()
             if t:
                 t.current_round = current_round
-                t.current_index = 0 # Reset index for each round
+                t.current_index = 0
                 db.commit()
 
-            delay = max(delay_ms, 0) / 1000.0
-            ids = list(group_ids)
-            random.shuffle(ids)
+            if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                grades = classify_groups(db, account, group_ids)
+                role = classify_account(db, account)
+                ids = select_groups_for_account(role, group_ids, grades)
+            else:
+                ids = list(group_ids)
+                random.shuffle(ids)
             for idx, gid in enumerate(ids):
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if t and t.stop_requested:
@@ -877,16 +1119,19 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     t.finished_at = CONFIG.now()
                     db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
                     db.commit()
-                    return  # Stop the entire task
+                    return
 
                 while t and t.paused:
                     await asyncio.sleep(1)
                     t = db.query(Task).filter(Task.id == task_id).first()
 
+                send_text = message
+                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                    send_text = randomize_message(message)
                 ok, err, msg_id = await multi_manager.send_message_to_group(
                     account,
                     group_id=gid,
-                    text=message,
+                    text=send_text,
                     parse_mode=parse_mode,
                     disable_web_page_preview=disable_web_page_preview,
                 )
@@ -914,31 +1159,39 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 if t:
                     if ok:
                         t.success = (t.success or 0) + 1
-                        consecutive_failures = 0  # 成功则重置计数器
+                        consecutive_failures = 0
                     else:
                         t.failed = (t.failed or 0) + 1
-                        consecutive_failures += 1  # 失败则增加计数器
+                        consecutive_failures += 1
                         
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            print(f"[AUTO-STOP] {account}: {consecutive_failures} consecutive failures, stopping task")
                             t.status = "error"
                             t.finished_at = CONFIG.now()
                             db.add(TaskEvent(
                                 task_id=task_id, 
                                 event="auto_stopped", 
-                                detail=f"连续失败{consecutive_failures}次，自动停止任务",
+                                detail=str(consecutive_failures),
                                 meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
                             ))
                             db.commit()
-                            return  # 停止任务
+                            return
                             
                     t.current_index = (t.current_index or 0) + 1
                     t.heartbeat_at = CONFIG.now()
                     db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
                 db.commit()
 
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                    rate = recent_fail_rate(db, account, int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50)))
+                    base_ms = dynamic_delay_ms(delay_ms, rate)
+                    jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
+                    jitter = random.uniform(-jitter_pct, jitter_pct) * base_ms
+                    wait_ms = max(0, base_ms + jitter)
+                    await asyncio.sleep(wait_ms / 1000.0)
+                else:
+                    d = max(delay_ms, 0) / 1000.0
+                    if d > 0:
+                        await asyncio.sleep(d)
 
             if current_round < rounds:
                 t = db.query(Task).filter(Task.id == task_id).first()
@@ -974,12 +1227,87 @@ async def login_send_code(request: Request):
     force_sms = body.get("force_sms", False)
     force_new_session = body.get("force_new_session", False)
     if not phone:
-        return JSONResponse({"detail": "phone required"}, status_code=400)
+        try:
+            db: Session = SessionLocal()
+            try:
+                row = db.query(SystemKV).filter(SystemKV.k == f"login_phone:{account}").first()
+                if row and row.v:
+                    try:
+                        d = json.loads(row.v)
+                        ph = (d.get("phone") or "").strip()
+                        if ph:
+                            phone = ph
+                    except Exception:
+                        pass
+            finally:
+                db.close()
+        except Exception:
+            pass
+        if not phone:
+            return JSONResponse({"detail": "phone required"}, status_code=400)
     try:
         resp = await multi_manager.send_login_code(account, phone, force_sms=force_sms, force_new_session=force_new_session)
+        try:
+            if isinstance(resp, dict) and not resp.get("ok", True):
+                if "retry_after" in resp:
+                    return JSONResponse(resp, status_code=429, headers={"Retry-After": str(resp.get("retry_after", 60))})
+                err = str(resp.get("error", "")).lower()
+                if "phone_invalid" in err or "phone" in err:
+                    return JSONResponse(resp, status_code=400)
+                return JSONResponse(resp, status_code=500)
+        except Exception:
+            pass
         return JSONResponse(resp)
     except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
+
+
+@app.route("/api/login/default-phone", methods=["POST"])
+async def set_default_phone(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    account = (body.get("account") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if not account or not phone:
+        return JSONResponse({"detail": "account and phone required"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        row = db.query(SystemKV).filter(SystemKV.k == f"login_phone:{account}").first()
+        payload = {"phone": phone}
+        if not row:
+            row = SystemKV(k=f"login_phone:{account}", v=json.dumps(payload, ensure_ascii=False))
+            db.add(row)
+        else:
+            row.v = json.dumps(payload, ensure_ascii=False)
+        db.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        db.close()
+
+
+@app.route("/api/login/default-phone")
+async def get_default_phone(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    account = (request.query_params.get("account") or "").strip()
+    if not account:
+        return JSONResponse({"detail": "account required"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        row = db.query(SystemKV).filter(SystemKV.k == f"login_phone:{account}").first()
+        phone = None
+        if row and row.v:
+            try:
+                d = json.loads(row.v)
+                phone = (d.get("phone") or "").strip() or None
+            except Exception:
+                phone = None
+        return JSONResponse({"account": account, "phone": phone})
+    finally:
+        db.close()
 
 
 @app.route("/api/login/submit-code", methods=["POST"])
@@ -1171,24 +1499,57 @@ async def send_multi_account(request: Request):
     finally:
         db.close()
     
-    # 为每个账号启动单独的发送任务，带有错开延迟
-    cumulative_delay = 0.0
-    for i, item in enumerate(task_ids):
-        # 计算累积启动延迟 (每个账号间隔 stagger_min_s ~ stagger_max_s 秒)
-        if i > 0:
-            cumulative_delay += random.uniform(stagger_min_s, stagger_max_s)
-        asyncio.create_task(_run_send_task_with_delay(
-            task_id=item["task_id"],
-            account=item["account"],
-            group_ids=group_ids,
-            message=message,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-            delay_ms=delay_ms,
-            rounds=rounds,
-            round_interval_s=round_interval_s,
-            start_delay=cumulative_delay,
-        ))
+    if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+        db2: Session = SessionLocal()
+        try:
+            items = []
+            for it in task_ids:
+                role = classify_account(db2, it["account"])
+                items.append({"account": it["account"], "task_id": it["task_id"], "role": role})
+            role_order = {"SAFE": 0, "CORE": 1, "RISK": 2}
+            items.sort(key=lambda x: role_order.get(x["role"], 1))
+            cumulative_delay = 0.0
+            for i, it in enumerate(items):
+                if i > 0:
+                    factor = 1.0
+                    if it["role"] == "SAFE":
+                        factor = 0.6
+                    elif it["role"] == "CORE":
+                        factor = 1.0
+                    elif it["role"] == "RISK":
+                        factor = 1.6
+                    cumulative_delay += random.uniform(stagger_min_s, stagger_max_s) * factor
+                asyncio.create_task(_run_send_task_with_delay(
+                    task_id=it["task_id"],
+                    account=it["account"],
+                    group_ids=group_ids,
+                    message=message,
+                    parse_mode=parse_mode,
+                    disable_web_page_preview=disable_web_page_preview,
+                    delay_ms=delay_ms,
+                    rounds=rounds,
+                    round_interval_s=round_interval_s,
+                    start_delay=cumulative_delay,
+                ))
+        finally:
+            db2.close()
+    else:
+        cumulative_delay = 0.0
+        for i, item in enumerate(task_ids):
+            if i > 0:
+                cumulative_delay += random.uniform(stagger_min_s, stagger_max_s)
+            asyncio.create_task(_run_send_task_with_delay(
+                task_id=item["task_id"],
+                account=item["account"],
+                group_ids=group_ids,
+                message=message,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+                delay_ms=delay_ms,
+                rounds=rounds,
+                round_interval_s=round_interval_s,
+                start_delay=cumulative_delay,
+            ))
     
     return JSONResponse({
         "tasks": task_ids,
