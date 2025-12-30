@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.telegram_client import MultiTelegramManager
 from app.models import SendLog, Task, TaskEvent
 from app.config import CONFIG
+from app.services.send_scheduler import SendScheduler
 
 
 _SEND_CACHE: dict[str, float] = {}
@@ -45,7 +46,15 @@ async def send_to_groups(
     retry_max: int = 0,
     retry_delay_ms: int = 1500,
 ):
+    use_sched = bool(getattr(CONFIG, "SCHEDULER_ENABLED", 1))
     ids = list(group_ids)
+    if use_sched:
+        sched = SendScheduler(db)
+        grading = sched.grade_groups(ids)
+        role = sched.account_role(account)
+        ids = sched.select_groups_for_account(role, grading.get("WHITE", []), grading.get("GREY", []))
+        black = set(grading.get("BLACK", []))
+        ids = [g for g in ids if g not in black]
     random.shuffle(ids)
     total = len(ids)
     success = 0
@@ -61,13 +70,41 @@ async def send_to_groups(
         if skipped:
             status = "skipped"
         else:
+            if use_sched and sched.should_pause_account(account):
+                status = "skipped"
+                err = "account_paused"
+                msg_id = None
+                preview = message[:200]
+                title = str(gid)
+                try:
+                    ent = await manager.get(account).client.get_entity(gid)
+                    title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
+                except Exception:
+                    title = str(gid)
+                db.add(
+                    SendLog(
+                        account_name=account,
+                        group_id=gid,
+                        group_title=title,
+                        message_preview=preview,
+                        status=status,
+                        error=None if status == "success" else (err or ("" if status == "skipped" else "send_failed")),
+                        message_id=msg_id,
+                        parse_mode=parse_mode,
+                    )
+                )
+                db.commit()
+                continue
             attempt = 0
             ok = False
             while attempt <= max(0, retry_max):
+                send_text = message
+                if use_sched:
+                    send_text = sched.fingerprint_message(message, parse_mode if parse_mode != "plain" else None)
                 ok, err, msg_id = await manager.send_message_to_group(
                     account,
                     group_id=gid,
-                    text=message,
+                    text=send_text,
                     parse_mode=parse_mode,
                     disable_web_page_preview=disable_web_page_preview,
                 )

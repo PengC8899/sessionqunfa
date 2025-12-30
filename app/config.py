@@ -25,6 +25,20 @@ class Settings:
     MULTI_ACCOUNT_ENABLED: int
     MULTI_ACCOUNT_MAX_CONCURRENT: int
     MULTI_ACCOUNT_STAGGER_MS: int
+    # 调度与风控参数
+    SCHEDULER_ENABLED: int
+    GROUP_RECENT_WINDOW: int
+    GROUP_BLACK_FAIL_RATE: float
+    GROUP_GREY_FAIL_RATE: float
+    GROUP_BLACK_CONSEC_FAILS: int
+    ACCOUNT_RECENT_WINDOW: int
+    ACCOUNT_SAFE_FAIL_RATE: float
+    ACCOUNT_RISK_FAIL_RATE: float
+    ACCOUNT_CONSEC_FAILS_PAUSE: int
+    MESSAGE_FINGERPRINT_ENABLED: int
+    MESSAGE_NUMBER_JITTER_PCT: float
+    MESSAGE_EMOJI_TOGGLE_PROB: float
+    MESSAGE_WHITESPACE_JITTER_PROB: float
 
     def __init__(self):
         admin_token = os.getenv("ADMIN_TOKEN") or os.getenv("ADMIN_PASSWORD")
@@ -60,6 +74,41 @@ class Settings:
         self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "5"))
         # 账号之间的发送间隔 (ms)，防止风控
         self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "3000"))
+        self.SCHEDULER_ENABLED = int(os.getenv("SCHEDULER_ENABLED", "1"))
+        self.GROUP_RECENT_WINDOW = int(os.getenv("GROUP_RECENT_WINDOW", "50"))
+        try:
+            self.GROUP_BLACK_FAIL_RATE = float(os.getenv("GROUP_BLACK_FAIL_RATE", "0.6"))
+        except Exception:
+            self.GROUP_BLACK_FAIL_RATE = 0.6
+        try:
+            self.GROUP_GREY_FAIL_RATE = float(os.getenv("GROUP_GREY_FAIL_RATE", "0.3"))
+        except Exception:
+            self.GROUP_GREY_FAIL_RATE = 0.3
+        self.GROUP_BLACK_CONSEC_FAILS = int(os.getenv("GROUP_BLACK_CONSEC_FAILS", "3"))
+        self.ACCOUNT_RECENT_WINDOW = int(os.getenv("ACCOUNT_RECENT_WINDOW", "40"))
+        try:
+            self.ACCOUNT_SAFE_FAIL_RATE = float(os.getenv("ACCOUNT_SAFE_FAIL_RATE", "0.15"))
+        except Exception:
+            self.ACCOUNT_SAFE_FAIL_RATE = 0.15
+        try:
+            self.ACCOUNT_RISK_FAIL_RATE = float(os.getenv("ACCOUNT_RISK_FAIL_RATE", "0.35"))
+        except Exception:
+            self.ACCOUNT_RISK_FAIL_RATE = 0.35
+        self.ACCOUNT_CONSEC_FAILS_PAUSE = int(os.getenv("ACCOUNT_CONSEC_FAILS_PAUSE", "3"))
+        self.MESSAGE_FINGERPRINT_ENABLED = int(os.getenv("MESSAGE_FINGERPRINT_ENABLED", "1"))
+        try:
+            self.MESSAGE_NUMBER_JITTER_PCT = float(os.getenv("MESSAGE_NUMBER_JITTER_PCT", "0.03"))
+        except Exception:
+            self.MESSAGE_NUMBER_JITTER_PCT = 0.03
+        try:
+            self.MESSAGE_EMOJI_TOGGLE_PROB = float(os.getenv("MESSAGE_EMOJI_TOGGLE_PROB", "0.25"))
+        except Exception:
+            self.MESSAGE_EMOJI_TOGGLE_PROB = 0.25
+        try:
+            self.MESSAGE_WHITESPACE_JITTER_PROB = float(os.getenv("MESSAGE_WHITESPACE_JITTER_PROB", "0.4"))
+        except Exception:
+            self.MESSAGE_WHITESPACE_JITTER_PROB = 0.4
+        self.RISK_TRY_GROUPS = int(os.getenv("RISK_TRY_GROUPS", "2"))
 
         accounts_list = (os.getenv("TG_ACCOUNTS") or "").strip()
         accounts: dict = {}

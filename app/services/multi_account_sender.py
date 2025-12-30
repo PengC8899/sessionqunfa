@@ -17,6 +17,7 @@ from app.telegram_client import MultiTelegramManager
 from app.models import SendLog, Task, TaskEvent
 from sqlalchemy.orm import Session
 import json
+from app.services.send_scheduler import SendScheduler
 
 
 @dataclass
@@ -230,8 +231,17 @@ class MultiAccountSender:
         if not authorized:
             return {"total": len(group_ids), "success": 0, "failed": len(group_ids), "error": "no_authorized_accounts"}
         
-        # 分配群组
-        distribution = self._distribute_groups(group_ids, authorized)
+        use_sched = bool(getattr(CONFIG, "SCHEDULER_ENABLED", 1))
+        if use_sched:
+            sched = SendScheduler(db)
+            grading = sched.grade_groups(group_ids)
+            black = set(grading.get("BLACK", []))
+            white = grading.get("WHITE", [])
+            grey = grading.get("GREY", [])
+            filtered_groups = [g for g in (white + grey) if g not in black]
+            distribution = self._distribute_groups(filtered_groups, authorized)
+        else:
+            distribution = self._distribute_groups(group_ids, authorized)
         
         # 配置
         max_concurrent = min(CONFIG.MULTI_ACCOUNT_MAX_CONCURRENT, len(authorized))
@@ -255,12 +265,22 @@ class MultiAccountSender:
         async def process_account_batch(account: str, gids: List[int]):
             nonlocal success, failed, processed, stop_flag
             
+            role = "CORE"
+            if use_sched:
+                role = sched.account_role(account)
+                if role == "SAFE":
+                    gids = [g for g in gids if g in grading.get("WHITE", [])]
+                elif role == "RISK":
+                    random.shuffle(gids)
+                    gids = gids[:max(0, int(getattr(CONFIG, "RISK_TRY_GROUPS", 2)))]
             for gid in gids:
                 # 检查停止标志 (无需锁,只读)
                 if stop_flag:
                     return
                 
                 async with sem:
+                    if use_sched and sched.should_pause_account(account):
+                        continue
                     # 检查任务是否被停止 (需要锁保护数据库访问)
                     if task_id:
                         async with db_lock:
@@ -270,10 +290,13 @@ class MultiAccountSender:
                                 return
                     
                     # 发送消息 (不需要锁,这是 Telegram API 调用)
+                    send_text = message
+                    if use_sched:
+                        send_text = sched.fingerprint_message(message, parse_mode if parse_mode != "plain" else None)
                     result = await self.send_with_account(
                         account=account,
                         group_id=gid,
-                        message=message,
+                        message=send_text,
                         parse_mode=parse_mode,
                         disable_web_page_preview=disable_web_page_preview,
                         retry_max=retry_max,
@@ -361,4 +384,3 @@ def get_multi_sender(manager: MultiTelegramManager) -> MultiAccountSender:
     if multi_sender is None:
         multi_sender = MultiAccountSender(manager)
     return multi_sender
-
