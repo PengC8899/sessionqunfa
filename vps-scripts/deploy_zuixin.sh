@@ -68,9 +68,9 @@ echo "==> 第三步：在 VPS 上启动 Docker 服务（web 容器）..."
 ssh -i "${SSH_KEY}" "${VPS_USER}@${VPS_HOST}" bash << EOF
 set -e
 cd "${REMOTE_DIR}"
-docker compose up -d --build web
+docker compose up -d --build web caddy
 EOF
 
 echo "==> 部署完成"
-echo "VPS 地址: http://${VPS_HOST}:8001/"
-echo "如需通过域名 + HTTPS 访问，可再按文档配置 Caddy 或 Nginx 反向代理。"
+echo "VPS 地址: http://${VPS_HOST}/"
+echo "如需通过域名 + HTTPS 访问，可再按文档配置 Caddy 或 Nginx 反向代理."
