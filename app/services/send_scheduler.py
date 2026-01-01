@@ -97,42 +97,13 @@ class SendScheduler:
             return message
         if parse_mode and parse_mode in ("markdown", "html"):
             return self._whitespace_jitter(message)
-        m = self._number_jitter(message)
+        m = message
         m = self._emoji_toggle(m)
         m = self._whitespace_jitter(m)
         return m
 
     def _number_jitter(self, text: str) -> str:
-        pct = float(getattr(CONFIG, "MESSAGE_NUMBER_JITTER_PCT", 0.03))
-        if pct <= 0.0:
-            return text
-        def repl(m: re.Match):
-            i, j = m.start(), m.end()
-            start = i
-            while start > 0:
-                ch = text[start - 1]
-                if ch.isalnum() or ch == "_":
-                    start -= 1
-                else:
-                    break
-            token_left = text[start:i]
-            if "@" in token_left:
-                return m.group(0)
-            s = m.group(0)
-            try:
-                v = float(s)
-            except:
-                return s
-            delta = v * random.uniform(-pct, pct)
-            nv = v + delta
-            if "." in s:
-                prec = max(0, len(s.split(".")[1]))
-                fmt = f"{{:.{prec}f}}"
-                return fmt.format(nv)
-            return str(int(round(nv)))
-        # 跳过 @用户名、单词内的数字和 URL 中的数字
-        pattern = r"(?<![\w@_])\d+(\.\d+)?(?!\w)"
-        return re.sub(pattern, repl, text)
+        return text
 
     def _emoji_toggle(self, text: str) -> str:
         p = float(getattr(CONFIG, "MESSAGE_EMOJI_TOGGLE_PROB", 0.25))

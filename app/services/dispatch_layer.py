@@ -117,40 +117,6 @@ def randomize_message(text: str) -> str:
             t = t + (" " if not t.endswith("\n") else "") + random.choice(ems)
         else:
             t = t.replace(random.choice(ems), "")
-    def _num_variation(m: re.Match) -> str:
-        try:
-            val = float(m.group(0))
-        except:
-            return m.group(0)
-        pct = random.uniform(-0.02, 0.02)
-        new_val = val * (1.0 + pct)
-        if m.group(0).isdigit():
-            return str(int(round(new_val)))
-        return f"{new_val:.2f}"
-    def _safe_number_jitter(src: str) -> str:
-        def repl(m: re.Match) -> str:
-            i, j = m.start(), m.end()
-            start = i
-            while start > 0:
-                ch = src[start - 1]
-                if ch.isalnum() or ch == "_":
-                    start -= 1
-                else:
-                    break
-            end = j
-            while end < len(src):
-                ch = src[end]
-                if ch.isalnum() or ch == "_":
-                    end += 1
-                else:
-                    break
-            token_left = src[start:i]
-            if "@" in token_left:
-                return m.group(0)
-            return _num_variation(m)
-        return re.sub(r"\d+(\.\d+)?", repl, src)
-    if random.random() < 0.3:
-        t = _safe_number_jitter(t)
     return t
 
 def recent_fail_rate(db: Session, account: str, window: int) -> float:
