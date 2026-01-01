@@ -104,6 +104,8 @@ class SendScheduler:
 
     def _number_jitter(self, text: str) -> str:
         pct = float(getattr(CONFIG, "MESSAGE_NUMBER_JITTER_PCT", 0.03))
+        if pct <= 0.0:
+            return text
         def repl(m: re.Match):
             i, j = m.start(), m.end()
             start = i
