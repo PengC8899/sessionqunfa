@@ -128,7 +128,9 @@ class SendScheduler:
                 fmt = f"{{:.{prec}f}}"
                 return fmt.format(nv)
             return str(int(round(nv)))
-        return re.sub(r"\b\d+(\.\d+)?\b", repl, text)
+        # 跳过 @用户名、单词内的数字和 URL 中的数字
+        pattern = r"(?<![\w@_])\d+(\.\d+)?(?!\w)"
+        return re.sub(pattern, repl, text)
 
     def _emoji_toggle(self, text: str) -> str:
         p = float(getattr(CONFIG, "MESSAGE_EMOJI_TOGGLE_PROB", 0.25))
