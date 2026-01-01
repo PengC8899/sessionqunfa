@@ -92,9 +92,9 @@ class AccountClientManager:
                         asyncio.create_task(_ON_PRIVATE_MESSAGE(self.session_name, event))
                     except Exception:
                         pass
-                reply_text = os.getenv("AUTO_REPLY_TEXT", "hello")
+                reply_text = os.getenv("AUTO_REPLY_TEXT", "Hi, I’m not handling details on this account.\nPlease message @JHT_66  or @JHT_6  directly, it’ll be easier to communicate there.")
                 if reply_text is None:
-                    reply_text = "hello"
+                    reply_text = "Hi, I’m not handling details on this account.\nPlease message @JHT_66  or @JHT_6  directly, it’ll be easier to communicate there."
                 reply_text = reply_text.replace("\\n", "\n")
                 await event.reply(reply_text, parse_mode=None, link_preview=False)
                 print(f"[INFO] Auto-replied '{reply_text}' to {event.sender_id} on account {self.session_name}")
