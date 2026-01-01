@@ -104,7 +104,18 @@ class SendScheduler:
 
     def _number_jitter(self, text: str) -> str:
         pct = float(getattr(CONFIG, "MESSAGE_NUMBER_JITTER_PCT", 0.03))
-        def repl(m):
+        def repl(m: re.Match):
+            i, j = m.start(), m.end()
+            start = i
+            while start > 0:
+                ch = text[start - 1]
+                if ch.isalnum() or ch == "_":
+                    start -= 1
+                else:
+                    break
+            token_left = text[start:i]
+            if "@" in token_left:
+                return m.group(0)
             s = m.group(0)
             try:
                 v = float(s)
