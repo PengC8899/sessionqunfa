@@ -847,7 +847,7 @@ async def send_async(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = int(body.get("rounds", 30))
+    rounds = int(body.get("rounds", 100))
     round_interval_s = int(body.get("round_interval_s", 600))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
