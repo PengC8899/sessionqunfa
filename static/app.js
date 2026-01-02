@@ -279,7 +279,7 @@ async function send(path) {
   const msg = document.getElementById('message').value;
   const parseMode = document.getElementById('parseMode').value;
   const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
-  const rounds = parseInt(document.getElementById('rounds')?.value || '30');
+  const rounds = parseInt(document.getElementById('rounds')?.value || '100');
   const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
@@ -1272,7 +1272,7 @@ async function startBatchSend() {
   // 获取发送参数
   const parseMode = document.getElementById('parseMode')?.value || 'plain';
   const delayMs = parseInt(document.getElementById('delayMs')?.value) || 11000;
-  const rounds = parseInt(document.getElementById('rounds')?.value) || 1;
+  const rounds = parseInt(document.getElementById('rounds')?.value) || 100;
   const roundIntervalS = parseInt(document.getElementById('roundInterval')?.value) || 600;
   const disablePreview = document.getElementById('disablePreview')?.checked ?? true;
   
