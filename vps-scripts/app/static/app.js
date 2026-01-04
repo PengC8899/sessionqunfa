@@ -260,6 +260,7 @@ async function fetchLogs() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${r.created_at || ''}</td>
+      <td>${r.account_name || ''}</td>
       <td>${r.group_title || r.group_id}</td>
       <td>${r.status}</td>
       <td>${r.message_id || ''}</td>

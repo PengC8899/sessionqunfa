@@ -367,6 +367,7 @@ async function fetchLogs() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td style="color:var(--text-muted); font-size:12px;">${r.created_at || ''}</td>
+      <td style="font-size:12px;">${r.account_name || ''}</td>
       <td>${r.group_title || r.group_id}</td>
       <td class="${r.status === 'success' ? 'status-success' : 'status-error'}">${r.status}</td>
       <td style="font-size:12px;">${r.error || r.message_id || ''}</td>

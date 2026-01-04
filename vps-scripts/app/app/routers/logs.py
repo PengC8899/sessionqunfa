@@ -23,6 +23,7 @@ def recent_logs(request: Request, limit: int = 50, db: Session = Depends(get_db)
     return [
         {
             "id": r.id,
+            "account_name": getattr(r, "account_name", None),
             "group_id": r.group_id,
             "group_title": r.group_title,
             "message_preview": r.message_preview,
