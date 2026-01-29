@@ -71,9 +71,9 @@ class Settings:
         
         # 多账号并发配置
         self.MULTI_ACCOUNT_ENABLED = int(os.getenv("MULTI_ACCOUNT_ENABLED", "1"))
-        self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "5"))
+        self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "3"))
         # 账号之间的发送间隔 (ms)，防止风控
-        self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "3000"))
+        self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "5000"))
         self.SCHEDULER_ENABLED = int(os.getenv("SCHEDULER_ENABLED", "1"))
         self.GROUP_RECENT_WINDOW = int(os.getenv("GROUP_RECENT_WINDOW", "50"))
         try:

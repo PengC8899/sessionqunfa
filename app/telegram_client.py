@@ -10,10 +10,42 @@ import os
 import glob
 import tempfile
 import shutil
+import random
+import hashlib
 
 COPY_RECEIVER_ACCOUNT = None
 COPY_RECEIVER_ENABLED = 0
 _ON_PRIVATE_MESSAGE = None
+
+def _generate_device_info(session_name: str):
+    """
+    根据 session_name 生成固定的设备指纹信息。
+    保证同一个账号在不同时间启动时，设备指纹保持一致（避免被判定为新设备登录）。
+    """
+    # 使用 session_name 的 hash 作为种子
+    seed_val = int(hashlib.sha256(session_name.encode("utf-8")).hexdigest(), 16)
+    rng = random.Random(seed_val)
+    
+    models = [
+        "Samsung Galaxy S24 Ultra", "Samsung Galaxy S23", "Pixel 8 Pro", "Pixel 7", 
+        "Xiaomi 14", "OnePlus 12", "Huawei Mate 60", "Sony Xperia 1 V",
+        "iPhone 15 Pro Max", "iPhone 14", "iPad Pro 12.9", "iPad Air 5"
+    ]
+    sys_vers = [
+        "Android 14", "Android 13", "Android 12", 
+        "iOS 17.4", "iOS 16.6", "iOS 15.7",
+        "Windows 11", "macOS 14.4"
+    ]
+    app_vers = ["10.8.1", "10.6.2", "9.5.4", "8.9.1", "4.16.4"]
+    langs = ["en", "en", "zh-cn", "es", "ru"]
+    
+    return {
+        "device_model": rng.choice(models),
+        "system_version": rng.choice(sys_vers),
+        "app_version": rng.choice(app_vers),
+        "lang_code": rng.choice(langs),
+        "system_lang_code": rng.choice(langs),
+    }
 
 def set_copy_receiver(account: Optional[str], enabled: bool):
     global COPY_RECEIVER_ACCOUNT, COPY_RECEIVER_ENABLED
@@ -47,7 +79,19 @@ class AccountClientManager:
                 loop = asyncio.get_running_loop()
                 if self.client is None:
                     session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-                    self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+                    # 生成设备指纹
+                    device_params = _generate_device_info(self.session_name)
+                    self.client = TelegramClient(
+                        session_base, 
+                        self.api_id, 
+                        self.api_hash, 
+                        loop=loop,
+                        device_model=device_params["device_model"],
+                        system_version=device_params["system_version"],
+                        app_version=device_params["app_version"],
+                        lang_code=device_params["lang_code"],
+                        system_lang_code=device_params["system_lang_code"]
+                    )
                 if not self.client.is_connected():
                     await self.client.connect()
                 authorized = await self.client.is_user_authorized()

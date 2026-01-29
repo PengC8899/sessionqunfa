@@ -107,16 +107,34 @@ def randomize_message(text: str) -> str:
     if int(getattr(CONFIG, "CONTENT_FINGERPRINT_ENABLED", 1)) == 0:
         return text
     t = text
+    
+    # 1. 基础替换
     if random.random() < 0.6:
         t = re.sub(r"[ \t]{2,}", " ", t)
     if random.random() < 0.5:
         t = re.sub(r"\n{2,}", "\n", t)
+        
+    # 2. 零宽字符注入 (Zero-width injection) - 最有效的反 Hash
+    # \u200b (Zero Width Space), \u200c (Zero Width Non-Joiner), \u200d (Zero Width Joiner), \u2060 (Word Joiner)
+    zw_chars = ["\u200b", "\u200c", "\u200d", "\u2060"]
+    if random.random() < 0.8:  # 80% 概率启用
+        chars = list(t)
+        # 随机插入 1-3 个零宽字符
+        num_inserts = random.randint(1, 3)
+        for _ in range(num_inserts):
+            if len(chars) > 0:
+                pos = random.randint(0, len(chars))
+                chars.insert(pos, random.choice(zw_chars))
+        t = "".join(chars)
+
+    # 3. 尾部 Emoji
     if random.random() < 0.4:
-        ems = ["🔥", "✅", "✨", "📌", "💡", "🚀"]
+        ems = ["🔥", "✅", "✨", "📌", "💡", "🚀", "🎯", "⭐", "⚡"]
         if random.random() < 0.5:
             t = t + (" " if not t.endswith("\n") else "") + random.choice(ems)
         else:
             t = t.replace(random.choice(ems), "")
+            
     return t
 
 def recent_fail_rate(db: Session, account: str, window: int) -> float:
