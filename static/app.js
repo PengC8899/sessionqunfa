@@ -280,7 +280,7 @@ async function send(path) {
   const parseMode = document.getElementById('parseMode').value;
   const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
   const rounds = parseInt(document.getElementById('rounds')?.value || '100');
-  const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
+  const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '600');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
   if (!msg.trim()) { alert('消息不能为空'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
