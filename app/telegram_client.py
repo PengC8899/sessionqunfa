@@ -391,16 +391,35 @@ class AccountClientManager:
             pm = "markdown"
         elif parse_mode == "html":
             pm = "html"
-        try:
-            msg = await self.client.send_message(
-                entity=group_id,
+            
+        async def _do_send(entity):
+             return await self.client.send_message(
+                entity=entity,
                 message=text,
                 parse_mode=pm,
                 link_preview=not disable_web_page_preview,
             )
+
+        try:
+            msg = await _do_send(group_id)
             mid = getattr(msg, 'id', None)
             return True, None, mid
         except Exception as e:
+            # Handle "Invalid Peer" or "Could not find input entity"
+            # This happens when the entity is not in the local cache/session file
+            err_str = str(e).lower()
+            if "invalid peer" in err_str or "could not find the input entity" in err_str or "peer" in err_str:
+                try:
+                    print(f"[WARN] Peer {group_id} not found in cache or invalid, trying explicit get_entity...")
+                    # Force fetch entity from server
+                    entity = await self.client.get_entity(group_id)
+                    msg = await _do_send(entity)
+                    mid = getattr(msg, 'id', None)
+                    return True, None, mid
+                except Exception as e2:
+                    print(f"[ERROR] Failed to resolve/send to peer {group_id}: {e2}")
+                    return False, f"Peer Error: {str(e)} -> Resolve Failed: {str(e2)}", None
+            
             return False, str(e), None
 
     async def join_group(self, invite_link: str) -> dict:

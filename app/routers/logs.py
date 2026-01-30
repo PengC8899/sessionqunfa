@@ -35,3 +35,18 @@ def recent_logs(request: Request, limit: int = 50, db: Session = Depends(get_db)
         }
         for r in rows
     ]
+
+
+@router.post("/logs/clear")
+def clear_logs(request: Request, db: Session = Depends(get_db)):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    try:
+        db.query(SendLog).delete()
+        db.commit()
+        return {"ok": True, "message": "All logs cleared"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))

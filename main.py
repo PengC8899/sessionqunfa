@@ -571,6 +571,23 @@ async def recent_logs(request: Request):
         db.close()
 
 
+@app.route("/api/logs/clear", methods=["POST"])
+async def clear_logs(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    db: Session = SessionLocal()
+    try:
+        db.query(SendLog).delete()
+        db.commit()
+        return JSONResponse({"ok": True, "message": "All logs cleared"})
+    except Exception as e:
+        db.rollback()
+        return JSONResponse({"detail": str(e)}, status_code=500)
+    finally:
+        db.close()
+
+
 @app.route("/api/logs/export.csv")
 async def export_logs_csv(request: Request):
     token = request.headers.get("X-Admin-Token")
@@ -688,10 +705,24 @@ async def startup_event():
         for t in rows:
             try:
                 gids = json.loads(t.group_ids_json or "[]")
+                # Resume from correct round and index
+                start_round = max(0, (t.current_round or 1) - 1)
                 start_idx = max(0, (t.current_index or 0))
-                rem = gids[start_idx:]
-                if rem:
-                    asyncio.create_task(_run_send_task(t.id, t.account_name, rem, t.message, t.parse_mode, bool(t.disable_web_page_preview), t.delay_ms, t.rounds or 1, t.round_interval_s or 0))
+                
+                if gids:
+                    asyncio.create_task(_run_send_task(
+                        task_id=t.id, 
+                        account=t.account_name, 
+                        group_ids=gids, 
+                        message=t.message, 
+                        parse_mode=t.parse_mode, 
+                        disable_web_page_preview=bool(t.disable_web_page_preview), 
+                        delay_ms=t.delay_ms, 
+                        rounds=t.rounds or 1, 
+                        round_interval_s=t.round_interval_s or 0,
+                        start_round_idx=start_round,
+                        start_group_idx=start_idx
+                    ))
             except Exception:
                 pass
     finally:
@@ -1092,18 +1123,19 @@ async def _run_send_task_with_delay(
     await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s)
 
 
-async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int):
+async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int, start_round_idx: int = 0, start_group_idx: int = 0):
     db: Session = SessionLocal()
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = int(getattr(CONFIG, "MAX_CONSECUTIVE_FAILURES", 10))
     
     try:
-        for i in range(rounds):
+        for i in range(start_round_idx, rounds):
             current_round = i + 1
             t = db.query(Task).filter(Task.id == task_id).first()
             if t:
                 t.current_round = current_round
-                t.current_index = 0
+                if i != start_round_idx:
+                    t.current_index = 0
                 db.commit()
 
             if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
@@ -1113,6 +1145,14 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             else:
                 ids = list(group_ids)
                 random.shuffle(ids)
+            
+            # Resumption logic: skip groups if restarting in the middle of a round
+            if i == start_round_idx and start_group_idx > 0:
+                if start_group_idx < len(ids):
+                    ids = ids[start_group_idx:]
+                else:
+                    ids = []
+
             for idx, gid in enumerate(ids):
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if t and t.stop_requested:
@@ -1166,16 +1206,17 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         consecutive_failures += 1
                         
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            t.status = "error"
-                            t.finished_at = CONFIG.now()
+                            # 7*24 continuous running: pause and retry instead of stopping
                             db.add(TaskEvent(
                                 task_id=task_id, 
-                                event="auto_stopped", 
-                                detail=str(consecutive_failures),
+                                event="auto_pause", 
+                                detail=f"sleeping_10m_failures_{consecutive_failures}",
                                 meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
                             ))
                             db.commit()
-                            return
+                            await asyncio.sleep(600)  # Sleep 10 minutes
+                            consecutive_failures = 0  # Reset counter
+                            continue  # Continue to next group/retry
                             
                     t.current_index = (t.current_index or 0) + 1
                     t.heartbeat_at = CONFIG.now()

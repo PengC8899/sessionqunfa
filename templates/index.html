@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Telegram 群发控制面板</title>
-  <link rel="stylesheet" href="/static/style.css?v=3.3" />
+  <link rel="stylesheet" href="/static/style.css?v=3.5" />
 </head>
 <body>
   <div class="app-container">
@@ -189,7 +189,10 @@
             <div class="panel" style="flex: 1;">
               <div class="panel-header">
                 <span>最近日志</span>
-                <button id="clearCacheBtn" class="btn btn-secondary btn-sm">清理缓存</button>
+                <div style="display:flex; gap:0.5rem;">
+                  <button id="clearLogsBtn" class="btn btn-danger btn-sm">清空日志</button>
+                  <button id="clearCacheBtn" class="btn btn-secondary btn-sm">清理缓存</button>
+                </div>
               </div>
               <div class="panel-body" style="padding:0;">
                 <div class="table-container">
@@ -380,6 +383,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=4.2"></script>
+  <script src="/static/app.js?v=3.5"></script>
 </body>
 </html>

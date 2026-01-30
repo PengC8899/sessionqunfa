@@ -421,6 +421,10 @@ function bindEvents() {
   if (clearBtn) {
     clearBtn.addEventListener('click', clearCache);
   }
+  const clearLogsBtn = document.getElementById('clearLogsBtn');
+  if (clearLogsBtn) {
+    clearLogsBtn.addEventListener('click', clearLogs);
+  }
   const summaryRefresh = document.getElementById('summaryRefresh');
   if (summaryRefresh) {
     summaryRefresh.addEventListener('click', () => fetchGlobalSummary(true));
@@ -596,6 +600,26 @@ async function clearCache() {
     alert('缓存已清除');
   } else {
     alert('清除缓存失败');
+  }
+}
+
+async function clearLogs() {
+  if (!state.token) { alert('请输入令牌并点击“保存”'); return; }
+  if (!confirm('确定要清空所有日志吗？此操作不可恢复。')) return;
+  try {
+    const res = await fetch('/api/logs/clear', {
+      method: 'POST',
+      headers: { 'X-Admin-Token': state.token }
+    });
+    if (res.ok) {
+      alert('日志已清空');
+      fetchLogs();
+    } else {
+      const d = await res.json();
+      alert('清空失败: ' + (d.detail || '未知错误'));
+    }
+  } catch (e) {
+    alert('请求出错: ' + e);
   }
 }
 
@@ -1178,7 +1202,6 @@ async function batchJoinGroups() {
           await new Promise(r => setTimeout(r, delayMs));
         }
       }
-      
       statusEl.textContent = `✅ 完成! 成功: ${successCount}, 失败: ${failCount}`;
       statusEl.style.color = 'var(--success-color)';
       
