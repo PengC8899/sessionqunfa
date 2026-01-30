@@ -1124,27 +1124,29 @@ async def _run_send_task_with_delay(
 
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int, start_round_idx: int = 0, start_group_idx: int = 0):
-    db: Session = SessionLocal()
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = int(getattr(CONFIG, "MAX_CONSECUTIVE_FAILURES", 10))
     
     try:
         for i in range(start_round_idx, rounds):
             current_round = i + 1
-            t = db.query(Task).filter(Task.id == task_id).first()
-            if t:
-                t.current_round = current_round
-                if i != start_round_idx:
-                    t.current_index = 0
-                db.commit()
+            
+            # --- Round Setup ---
+            with SessionLocal() as db:
+                t = db.query(Task).filter(Task.id == task_id).first()
+                if t:
+                    t.current_round = current_round
+                    if i != start_round_idx:
+                        t.current_index = 0
+                    db.commit()
 
-            if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
-                grades = classify_groups(db, account, group_ids)
-                role = classify_account(db, account)
-                ids = select_groups_for_account(role, group_ids, grades)
-            else:
-                ids = list(group_ids)
-                random.shuffle(ids)
+                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                    grades = classify_groups(db, account, group_ids)
+                    role = classify_account(db, account)
+                    ids = select_groups_for_account(role, group_ids, grades)
+                else:
+                    ids = list(group_ids)
+                    random.shuffle(ids)
             
             # Resumption logic: skip groups if restarting in the middle of a round
             if i == start_round_idx and start_group_idx > 0:
@@ -1153,78 +1155,105 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 else:
                     ids = []
 
+            # --- Process Groups ---
             for idx, gid in enumerate(ids):
-                t = db.query(Task).filter(Task.id == task_id).first()
-                if t and t.stop_requested:
-                    t.status = "stopped"
-                    t.finished_at = CONFIG.now()
-                    db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
-                    db.commit()
-                    return
-
-                while t and t.paused:
-                    await asyncio.sleep(1)
+                # Use a fresh session for each message to avoid long-lived session issues
+                with SessionLocal() as db:
                     t = db.query(Task).filter(Task.id == task_id).first()
+                    
+                    # Check stop/pause
+                    if t and t.stop_requested:
+                        t.status = "stopped"
+                        t.finished_at = CONFIG.now()
+                        db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
+                        db.commit()
+                        return
 
-                send_text = message
-                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
-                    send_text = randomize_message(message)
-                ok, err, msg_id = await multi_manager.send_message_to_group(
-                    account,
-                    group_id=gid,
-                    text=send_text,
-                    parse_mode=parse_mode,
-                    disable_web_page_preview=disable_web_page_preview,
-                )
-                status = "success" if ok else "failed"
-                preview = message[:200]
-                title = str(gid)
-                try:
-                    ent = await multi_manager.get(account).client.get_entity(gid)
-                    title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
-                except Exception:
+                    while t and t.paused:
+                        db.commit() # Commit any pending
+                        db.close() # Close while sleeping
+                        await asyncio.sleep(1)
+                        db = SessionLocal() # Re-open
+                        t = db.query(Task).filter(Task.id == task_id).first()
+
+                    # Check again after pause loop
+                    if t and t.stop_requested:
+                        t.status = "stopped"
+                        t.finished_at = CONFIG.now()
+                        db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
+                        db.commit()
+                        return
+
+                    # Send Logic
+                    send_text = message
+                    if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                        send_text = randomize_message(message)
+                    
+                    # Call async send (no DB involved here)
+                    ok, err, msg_id = await multi_manager.send_message_to_group(
+                        account,
+                        group_id=gid,
+                        text=send_text,
+                        parse_mode=parse_mode,
+                        disable_web_page_preview=disable_web_page_preview,
+                    )
+                    
+                    # Logging
+                    status = "success" if ok else "failed"
+                    preview = message[:200]
                     title = str(gid)
+                    try:
+                        ent = await multi_manager.get(account).client.get_entity(gid)
+                        title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
+                    except Exception:
+                        title = str(gid)
 
-                log = SendLog(
-                    account_name=account,
-                    group_id=gid,
-                    group_title=title,
-                    message_preview=preview,
-                    status=status,
-                    error=None if ok else (err or "send_failed"),
-                    message_id=msg_id,
-                    parse_mode=parse_mode,
-                )
-                db.add(log)
-                t = db.query(Task).filter(Task.id == task_id).first()
-                if t:
-                    if ok:
-                        t.success = (t.success or 0) + 1
-                        consecutive_failures = 0
-                    else:
-                        t.failed = (t.failed or 0) + 1
-                        consecutive_failures += 1
+                    log = SendLog(
+                        account_name=account,
+                        group_id=gid,
+                        group_title=title,
+                        message_preview=preview,
+                        status=status,
+                        error=None if ok else (err or "send_failed"),
+                        message_id=msg_id,
+                        parse_mode=parse_mode,
+                    )
+                    db.add(log)
+                    
+                    t = db.query(Task).filter(Task.id == task_id).first()
+                    if t:
+                        if ok:
+                            t.success = (t.success or 0) + 1
+                            consecutive_failures = 0
+                        else:
+                            t.failed = (t.failed or 0) + 1
+                            consecutive_failures += 1
                         
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            # 7*24 continuous running: pause and retry instead of stopping
-                            db.add(TaskEvent(
-                                task_id=task_id, 
-                                event="auto_pause", 
-                                detail=f"sleeping_10m_failures_{consecutive_failures}",
-                                meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
-                            ))
-                            db.commit()
-                            await asyncio.sleep(600)  # Sleep 10 minutes
-                            consecutive_failures = 0  # Reset counter
-                            continue  # Continue to next group/retry
-                            
-                    t.current_index = (t.current_index or 0) + 1
-                    t.heartbeat_at = CONFIG.now()
-                    db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
-                db.commit()
+                        t.current_index = (t.current_index or 0) + 1
+                        t.heartbeat_at = CONFIG.now()
+                        db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
+                    
+                    # Auto-pause logic
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                         db.add(TaskEvent(
+                            task_id=task_id, 
+                            event="auto_pause", 
+                            detail=f"sleeping_10m_failures_{consecutive_failures}",
+                            meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
+                        ))
+                    
+                    db.commit()
+                
+                # Handle auto-pause outside of DB session
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    await asyncio.sleep(600)
+                    consecutive_failures = 0
+                    continue
 
+                # Sleep between messages
                 if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
-                    rate = recent_fail_rate(db, account, int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50)))
+                    with SessionLocal() as db:
+                        rate = recent_fail_rate(db, account, int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50)))
                     base_ms = dynamic_delay_ms(delay_ms, rate)
                     jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
                     jitter = random.uniform(-jitter_pct, jitter_pct) * base_ms
@@ -1235,28 +1264,35 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     if d > 0:
                         await asyncio.sleep(d)
 
+            # --- End of Round ---
             if current_round < rounds:
-                t = db.query(Task).filter(Task.id == task_id).first()
-                if t:
-                    t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
-                    db.commit()
+                with SessionLocal() as db:
+                    t = db.query(Task).filter(Task.id == task_id).first()
+                    if t:
+                        t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
+                        db.commit()
                 await asyncio.sleep(round_interval_s)
 
-        t = db.query(Task).filter(Task.id == task_id).first()
-        if t and t.status not in ("stopped", "error"):
-            t.status = "done"
-            t.finished_at = CONFIG.now()
-            db.add(TaskEvent(task_id=task_id, event="finished", detail="task_done", meta_json=json.dumps({}, ensure_ascii=False)))
-            db.commit()
+        # --- Task Done ---
+        with SessionLocal() as db:
+            t = db.query(Task).filter(Task.id == task_id).first()
+            if t and t.status not in ("stopped", "error"):
+                t.status = "done"
+                t.finished_at = CONFIG.now()
+                db.add(TaskEvent(task_id=task_id, event="finished", detail="task_done", meta_json=json.dumps({}, ensure_ascii=False)))
+                db.commit()
+
     except Exception as e:
-        t = db.query(Task).filter(Task.id == task_id).first()
-        if t:
-            t.status = "error"
-            t.finished_at = CONFIG.now()
-            db.add(TaskEvent(task_id=task_id, event="error", detail=f"task_error: {e}", meta_json=json.dumps({}, ensure_ascii=False)))
-            db.commit()
-    finally:
-        db.close()
+        try:
+            with SessionLocal() as db:
+                t = db.query(Task).filter(Task.id == task_id).first()
+                if t:
+                    t.status = "error"
+                    t.finished_at = CONFIG.now()
+                    db.add(TaskEvent(task_id=task_id, event="error", detail=f"task_error: {e}", meta_json=json.dumps({}, ensure_ascii=False)))
+                    db.commit()
+        except Exception:
+            print(f"CRITICAL: Failed to log error to DB for task {task_id}: {e}")
 
 @app.route("/api/login/send-code", methods=["POST"])
 async def login_send_code(request: Request):
