@@ -417,8 +417,17 @@ class AccountClientManager:
                     mid = getattr(msg, 'id', None)
                     return True, None, mid
                 except Exception as e2:
-                    print(f"[ERROR] Failed to resolve/send to peer {group_id}: {e2}")
-                    return False, f"Peer Error: {str(e)} -> Resolve Failed: {str(e2)}", None
+                    # Try refreshing dialogs as a last resort
+                    try:
+                        print(f"[WARN] Peer {group_id} still not found, refreshing dialogs...")
+                        await self.client.get_dialogs(limit=None)
+                        entity = await self.client.get_entity(group_id)
+                        msg = await _do_send(entity)
+                        mid = getattr(msg, 'id', None)
+                        return True, None, mid
+                    except Exception as e3:
+                        print(f"[ERROR] Failed to resolve/send to peer {group_id} after refresh: {e3}")
+                        return False, f"Peer Error: {str(e)} -> Resolve Failed: {str(e2)} -> Refresh Failed: {str(e3)}", None
             
             return False, str(e), None
 
