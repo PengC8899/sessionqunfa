@@ -136,9 +136,39 @@ class AccountClientManager:
                         asyncio.create_task(_ON_PRIVATE_MESSAGE(self.session_name, event))
                     except Exception:
                         pass
-                reply_text = os.getenv("AUTO_REPLY_TEXT", "Hi, I’m not handling details on this account.\nPlease message @JHT_66  or @JHT_6  directly, it’ll be easier to communicate there.")
+                default_reply = """🇮🇳 HY®PAY 🇮🇳 
+🔥 High-Volume Corporate Accounts Wanted 🔥 
+Stock Trading · Digital Payments · High-Turnover Transactions 
+
+🔆Account Type 
+🔆Enterprise / Company / Trade / LLC 
+
+✅ YES Bank – Business Account 
+✅ AU Small Finance Bank 
+✅ City Union Bank (CUB) 
+✅ Saraswat Bank 
+✅ IDFC Bank 
+✅ CBI 
+✅ Bandhan Bank 
+✅ IndusInd Bank 
+✅ Axis Bank – Neo Corporate 
+✅RBL 
+
+OTP work account： 
+payout Account: 
+✅ Axis Bank – Neo Corporate   RBL 
+Deposit 3000U, commission 3.5%, no title restrictions. 
+
+📍 Latest Face-to-Face Locations 
+Chandigarh · Bangalore  ·Mount abu · Delhi  · Mumbai 
+
+📩 Contact 
+Group inquiries or direct DM 
+👉 @HYHYA 
+👉 @HYHYHY5"""
+                reply_text = os.getenv("AUTO_REPLY_TEXT", default_reply)
                 if reply_text is None:
-                    reply_text = "Hi, I’m not handling details on this account.\nPlease message @JHT_66  or @JHT_6  directly, it’ll be easier to communicate there."
+                    reply_text = default_reply
                 reply_text = reply_text.replace("\\n", "\n")
                 await event.reply(reply_text, parse_mode=None, link_preview=False)
                 print(f"[INFO] Auto-replied '{reply_text}' to {event.sender_id} on account {self.session_name}")
