@@ -24,7 +24,8 @@ import asyncio
 import os
 import random
 import logging
-from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 import tempfile
 
 app = Starlette()
@@ -627,6 +628,7 @@ async def export_logs_csv(request: Request):
 
 
 async def startup_event():
+    print("[STARTUP] Event triggered")
     Base.metadata.create_all(bind=engine)
     try:
         with engine.connect() as conn:
@@ -710,7 +712,10 @@ async def startup_event():
                 start_idx = max(0, (t.current_index or 0))
                 
                 if gids:
-                    asyncio.create_task(_run_send_task(
+                    # Add stagger to prevent thundering herd on restart
+                    start_delay = random.uniform(5, 60)
+                    print(f"[STARTUP] Resuming task {t.id} for {t.account_name} at round {t.current_round} index {t.current_index} with delay {start_delay:.1f}s")
+                    asyncio.create_task(_run_send_task_with_delay(
                         task_id=t.id, 
                         account=t.account_name, 
                         group_ids=gids, 
@@ -721,7 +726,8 @@ async def startup_event():
                         rounds=t.rounds or 1, 
                         round_interval_s=t.round_interval_s or 0,
                         start_round_idx=start_round,
-                        start_group_idx=start_idx
+                        start_group_idx=start_idx,
+                        start_delay=start_delay
                     ))
             except Exception:
                 pass
@@ -1114,13 +1120,15 @@ async def _run_send_task_with_delay(
     rounds: int,
     round_interval_s: int,
     start_delay: float = 0,
+    start_round_idx: int = 0,
+    start_group_idx: int = 0,
 ):
     """带延迟启动的发送任务包装器"""
     if start_delay > 0:
         print(f"[TASK] {account}: waiting {start_delay:.1f}s before starting...")
         await asyncio.sleep(start_delay)
     print(f"[TASK] {account}: starting send task (task_id={task_id[:8]}...)")
-    await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s)
+    await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s, start_round_idx, start_group_idx)
 
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int, start_round_idx: int = 0, start_group_idx: int = 0):
@@ -1150,10 +1158,13 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             
             # Resumption logic: skip groups if restarting in the middle of a round
             if i == start_round_idx and start_group_idx > 0:
+                print(f"[TASK] {account}: Resuming round {current_round} from index {start_group_idx}")
                 if start_group_idx < len(ids):
                     ids = ids[start_group_idx:]
                 else:
                     ids = []
+            
+            print(f"[TASK] {account}: Processing round {current_round}, {len(ids)} groups remaining")
 
             # --- Process Groups ---
             for idx, gid in enumerate(ids):
@@ -1163,6 +1174,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     
                     # Check stop/pause
                     if t and t.stop_requested:
+                        print(f"[TASK] {account}: Stop requested")
                         t.status = "stopped"
                         t.finished_at = CONFIG.now()
                         db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
@@ -1170,14 +1182,16 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         return
 
                     while t and t.paused:
+                        print(f"[TASK] {account}: Paused")
                         db.commit() # Commit any pending
                         db.close() # Close while sleeping
                         await asyncio.sleep(1)
                         db = SessionLocal() # Re-open
                         t = db.query(Task).filter(Task.id == task_id).first()
-
+                    
                     # Check again after pause loop
                     if t and t.stop_requested:
+                        print(f"[TASK] {account}: Stop requested after pause")
                         t.status = "stopped"
                         t.finished_at = CONFIG.now()
                         db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
@@ -1190,6 +1204,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         send_text = randomize_message(message)
                     
                     # Call async send (no DB involved here)
+                    # print(f"[TASK] {account}: Sending to group {gid}")
                     ok, err, msg_id = await multi_manager.send_message_to_group(
                         account,
                         group_id=gid,
@@ -1200,6 +1215,8 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     
                     # Logging
                     status = "success" if ok else "failed"
+                    if not ok:
+                        print(f"[TASK] {account}: Failed to send to {gid}: {err}")
                     preview = message[:200]
                     title = str(gid)
                     try:
@@ -1266,12 +1283,44 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
 
             # --- End of Round ---
             if current_round < rounds:
-                with SessionLocal() as db:
-                    t = db.query(Task).filter(Task.id == task_id).first()
-                    if t:
-                        t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
-                        db.commit()
-                await asyncio.sleep(round_interval_s)
+                sleep_time = round_interval_s
+                update_db_time = True
+                
+                # Resuming a finished round?
+                if i == start_round_idx and len(ids) == 0:
+                    with SessionLocal() as db:
+                        t = db.query(Task).filter(Task.id == task_id).first()
+                        if t and t.next_round_at:
+                            target = t.next_round_at
+                            if target.tzinfo is None:
+                                # Assume it's in the configured timezone
+                                try:
+                                    tz = ZoneInfo(getattr(CONFIG, "TIMEZONE", "UTC"))
+                                except Exception:
+                                    tz = timezone.utc
+                                target = target.replace(tzinfo=tz)
+                            
+                            now = datetime.now(target.tzinfo)
+                            remaining = (target - now).total_seconds()
+                            
+                            if remaining <= 0:
+                                sleep_time = 0
+                                update_db_time = False
+                                print(f"[TASK] {account}: Skipping sleep, next round was due at {target}")
+                            else:
+                                sleep_time = remaining
+                                update_db_time = False
+                                print(f"[TASK] {account}: Sleeping remaining {remaining:.1f}s until {target}")
+
+                if update_db_time:
+                    with SessionLocal() as db:
+                        t = db.query(Task).filter(Task.id == task_id).first()
+                        if t:
+                            t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
+                            db.commit()
+                
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
 
         # --- Task Done ---
         with SessionLocal() as db:
