@@ -4,6 +4,7 @@ from starlette.templating import Jinja2Templates
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.responses import StreamingResponse, Response
 from starlette.requests import Request
+from starlette.middleware.cors import CORSMiddleware
 from app.config import CONFIG
 from app.database import Base, engine, SessionLocal
 from sqlalchemy import text
@@ -29,6 +30,12 @@ from datetime import datetime, timedelta, timezone
 import tempfile
 
 app = Starlette()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
