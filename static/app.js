@@ -1928,3 +1928,104 @@ async function batchJoinWithProtocols() {
   btn.disabled = false;
   btn.textContent = '🚀 开始批量加入';
 }
+
+// ========== Update Profile ==========
+function setupUpdateProfile() {
+  const updateProfileBtn = document.getElementById('updateProfileBtn');
+  const updateProfileModal = document.getElementById('updateProfileModal');
+  const closeUpdateProfileModal = document.getElementById('closeUpdateProfileModal');
+  const startUpdateProfileBtn = document.getElementById('startUpdateProfileBtn');
+
+  if (updateProfileBtn) {
+    updateProfileBtn.addEventListener('click', () => {
+      updateProfileModal.classList.remove('hidden');
+      document.getElementById('updateProfileStatus').textContent = '';
+    });
+  }
+
+  if (closeUpdateProfileModal) {
+    closeUpdateProfileModal.addEventListener('click', () => {
+      updateProfileModal.classList.add('hidden');
+    });
+  }
+  
+  if (updateProfileModal) {
+    updateProfileModal.addEventListener('click', (e) => {
+        if (e.target === updateProfileModal) {
+            updateProfileModal.classList.add('hidden');
+        }
+    });
+  }
+
+  if (startUpdateProfileBtn) {
+    startUpdateProfileBtn.addEventListener('click', async () => {
+      const firstName = document.getElementById('newFirstName').value.trim();
+      const fileInput = document.getElementById('newAvatarFile');
+      const statusDiv = document.getElementById('updateProfileStatus');
+      
+      if (!firstName) {
+        alert('请输入新昵称');
+        return;
+      }
+      
+      if (!confirm('确定要批量修改所有已登录账号的资料吗？此操作不可逆。')) {
+        return;
+      }
+      
+      statusDiv.textContent = '正在提交请求，请稍候...\n';
+      startUpdateProfileBtn.disabled = true;
+      
+      const formData = new FormData();
+      formData.append('first_name', firstName);
+      if (fileInput.files.length > 0) {
+        formData.append('photo', fileInput.files[0]);
+      }
+      
+      try {
+        const res = await fetch('/api/accounts/bulk-update-profile', {
+          method: 'POST',
+          headers: {
+            'X-Admin-Token': state.token
+          },
+          body: formData
+        });
+        
+        if (!res.ok) {
+          const err = await res.text();
+          statusDiv.textContent += `请求失败: ${err}\n`;
+          return;
+        }
+        
+        const data = await res.json();
+        let successCount = 0;
+        let failCount = 0;
+        let details = '';
+        
+        for (const [account, result] of Object.entries(data)) {
+            if (result.ok) {
+                successCount++;
+                let msg = `[${account}] ✅ 成功`;
+                if (result.details) {
+                    if (result.details.name === false) msg += ` (改名失败: ${result.details.name_error})`;
+                    if (result.details.photo === false) msg += ` (改头像失败: ${result.details.photo_error})`;
+                }
+                details += msg + '\n';
+            } else {
+                failCount++;
+                details += `[${account}] ❌ 失败: ${result.error}\n`;
+            }
+        }
+        
+        statusDiv.textContent = `完成! 成功: ${successCount}, 失败: ${failCount}\n\n详细结果:\n${details}`;
+        
+      } catch (e) {
+        statusDiv.textContent += `发生错误: ${e.message}\n`;
+      } finally {
+        startUpdateProfileBtn.disabled = false;
+      }
+    });
+  }
+}
+
+// Call setup
+setupUpdateProfile();

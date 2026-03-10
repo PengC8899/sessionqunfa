@@ -14,7 +14,7 @@ from app.models import SendLog, Task, TaskEvent, SystemKV
 from app.services.send_service import send_to_groups
 from app.services.group_service import get_groups, clear_group_cache
 # from app.services.multi_account_sender import get_multi_sender  # 暂不使用
-from app.routers.accounts import check_single_account, delete_account
+from app.routers.accounts import check_single_account, delete_account, bulk_update_profile
 from app.routers.system import reset_system
 from app.services.account_service import account_service
 from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate
@@ -143,6 +143,7 @@ async def list_authorized_accounts(request: Request):
 
 app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
 app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
+app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=["POST"])
 app.add_route("/api/system/reset", reset_system, methods=["POST"])
 
 

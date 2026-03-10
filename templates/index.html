@@ -159,6 +159,7 @@
                 <div style="display:flex; gap:0.5rem;">
                   <input id="summarySearch" type="text" class="input-field" style="padding:0.25rem 0.5rem; width:100px; font-size:0.75rem;" placeholder="筛选..." />
                   <button id="resetSystemBtn" class="btn btn-danger btn-sm">重置</button>
+                  <button id="updateProfileBtn" class="btn btn-secondary btn-sm" style="background:linear-gradient(135deg, #FF9800 0%, #F44336 100%); color:white;">一键改资料</button>
                   <button id="accountManageBtn" class="btn btn-secondary btn-sm">账号管理</button>
                   <button id="checkAccountsBtn" class="btn btn-secondary btn-sm">检查账号</button>
                   <button id="summaryRefresh" class="btn btn-secondary btn-sm">刷新</button>
@@ -379,6 +380,30 @@
           </div>
         </div>
         
+      </div>
+    </div>
+  </div>
+
+  <!-- Update Profile Modal -->
+  <div id="updateProfileModal" class="modal hidden">
+    <div class="modal-content" style="width: 500px; max-width: 95vw;">
+      <div class="modal-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem; border-bottom:1px solid var(--border-color); padding-bottom:0.5rem;">
+        <h3 style="margin:0;">✏️ 一键批量修改资料</h3>
+        <button id="closeUpdateProfileModal" style="background:none; border:none; font-size:1.5rem; cursor:pointer;">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom:1rem;">
+          <label class="input-label" style="display:block; margin-bottom:0.5rem;">新昵称 (First Name)</label>
+          <input type="text" id="newFirstName" class="input-field" value="HYpay#Broadcast" style="width:100%;" />
+        </div>
+        <div style="margin-bottom:1rem;">
+          <label class="input-label" style="display:block; margin-bottom:0.5rem;">新头像 (可选)</label>
+          <input type="file" id="newAvatarFile" accept="image/*" class="input-field" style="width:100%; padding:0.5rem;" />
+        </div>
+        <div style="margin-top:1.5rem; text-align:right;">
+          <button id="startUpdateProfileBtn" class="btn btn-primary" style="width:100%;">开始批量修改</button>
+        </div>
+        <div id="updateProfileStatus" class="text-sm text-muted" style="margin-top:1rem; white-space:pre-wrap; max-height:150px; overflow-y:auto; background:var(--bg-color); padding:0.5rem; border-radius:4px;"></div>
       </div>
     </div>
   </div>

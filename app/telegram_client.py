@@ -461,6 +461,46 @@ Group inquiries or direct DM
             
             return False, str(e), None
 
+    async def update_profile(self, first_name: str, last_name: str = "", photo_path: str = None):
+        """
+        更新账号个人资料（名称和头像）
+        """
+        await self.ensure_connected()
+        from telethon.tl.functions.account import UpdateProfileRequest
+        from telethon.tl.functions.photos import UploadProfilePhotoRequest
+        
+        results = {}
+        
+        # 1. 更新名称
+        try:
+            await self.client(UpdateProfileRequest(
+                first_name=first_name,
+                last_name=last_name
+            ))
+            results["name"] = True
+        except Exception as e:
+            print(f"[ERROR] Failed to update name for {self.session_name}: {e}")
+            results["name"] = False
+            results["name_error"] = str(e)
+            
+        # 2. 更新头像
+        if photo_path and os.path.exists(photo_path):
+            try:
+                # 某些版本的 Telethon 可以直接传文件路径给 upload_profile_photo
+                # 但更稳妥的是先上传文件
+                file = await self.client.upload_file(photo_path)
+                await self.client(UploadProfilePhotoRequest(fallback=False, file=file))
+                results["photo"] = True
+            except Exception as e:
+                print(f"[ERROR] Failed to update photo for {self.session_name}: {e}")
+                results["photo"] = False
+                results["photo_error"] = str(e)
+        elif photo_path:
+            results["photo"] = False
+            results["photo_error"] = "photo_file_not_found"
+            
+        return results
+
     async def join_group(self, invite_link: str) -> dict:
         """
         通过邀请链接加入群组
@@ -703,6 +743,9 @@ class MultiTelegramManager:
     async def join_group(self, account: str, invite_link: str) -> dict:
         """通过邀请链接加入群组"""
         return await self.get(account).join_group(invite_link)
+
+    async def update_profile(self, account: str, first_name: str, last_name: str = "", photo_path: str = None):
+        return await self.get(account).update_profile(first_name, last_name, photo_path)
 
 
 multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)
