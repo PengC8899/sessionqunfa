@@ -29,20 +29,18 @@ async def bulk_update_profile(request: Request):
         photo_path = None
         
         if photo_file and getattr(photo_file, "filename", None):
-            # Save to static folder
-            static_dir = os.path.join(os.getcwd(), "static")
-            if not os.path.exists(static_dir):
-                os.makedirs(static_dir)
-                
+            upload_dir = "/app/data/profile_uploads"
+            if not os.path.exists(upload_dir):
+                os.makedirs(upload_dir, exist_ok=True)
+
             filename = photo_file.filename
             ext = os.path.splitext(filename)[1]
             if not ext:
-                ext = ".jpg" # Default extension
-            
-            # Use a unique name
+                ext = ".jpg"
+
             filename = f"avatar_update_{uuid.uuid4()}{ext}"
-            photo_path = os.path.join(static_dir, filename)
-            
+            photo_path = os.path.join(upload_dir, filename)
+
             content = await photo_file.read()
             with open(photo_path, 'wb') as f:
                 f.write(content)
