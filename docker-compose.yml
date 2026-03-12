@@ -12,8 +12,8 @@ services:
       - SESSION_DIR=/sessions
       - DB_URL=sqlite:////app/data/data.db
     volumes:
-      - ./sessions:/sessions
-      - ./data:/app/data
+      - ${HOST_SESSION_DIR:-./sessions}:/sessions
+      - ${HOST_DATA_DIR:-./data}:/app/data
       - ./templates:/app/templates:ro
       - ./static:/app/static:ro
     restart: unless-stopped

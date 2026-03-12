@@ -21,6 +21,7 @@ Thumbs.db
 
 # Telegram Sessions (SENSITIVE)
 sessions/
+sessions_*/
 *.session
 *.session-journal
 
@@ -29,6 +30,7 @@ sessions/
 *.db-shm
 *.db-wal
 data/
+data_*/
 
 # Security Keys (EXTREMELY SENSITIVE)
 *.pem
