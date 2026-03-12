@@ -63,10 +63,27 @@ INLINE_BOT_QUERY = "694014ffc3b8e"
 # AUTO_REPLY_TEXT = ... 
 
 class AccountClientManager:
-    def __init__(self, session_name: str, api_id: int, api_hash: str):
+    def __init__(self, session_name: str, api_id: int = None, api_hash: str = None):
         self.session_name = session_name
-        self.api_id = api_id
-        self.api_hash = api_hash
+        
+        # 如果初始化未提供 api_id/hash，则从配置中随机选择一个
+        if api_id is None or api_hash is None:
+            if CONFIG.TG_API_KEYS:
+                # 基于 session_name 的 hash 来选择 api key，保证同一个 session 总是使用同一个 api key
+                # 这样可以避免频繁更换 api key 导致的风控
+                seed_val = int(hashlib.sha256(session_name.encode("utf-8")).hexdigest(), 16)
+                key_idx = seed_val % len(CONFIG.TG_API_KEYS)
+                creds = CONFIG.TG_API_KEYS[key_idx]
+                self.api_id = int(creds["api_id"])
+                self.api_hash = creds["api_hash"]
+            else:
+                # Fallback (should not happen if config is correct)
+                self.api_id = CONFIG.TG_API_ID
+                self.api_hash = CONFIG.TG_API_HASH
+        else:
+            self.api_id = api_id
+            self.api_hash = api_hash
+            
         self.client: Optional[TelegramClient] = None
         self._connected = False
         self._auto_reply_setup = False
@@ -682,10 +699,15 @@ class MultiTelegramManager:
         if account not in self.managers:
             # Dynamically create a manager for the account if it doesn't exist.
             session_name = account
+            
+            # 尝试从全局配置获取，如果获取不到则传递 None，让 AccountClientManager 从 Pool 中选择
             api_id = int(CONFIG.TG_API_ID) if CONFIG.TG_API_ID is not None else None
             api_hash = CONFIG.TG_API_HASH
-            if not api_id or not api_hash:
-                raise RuntimeError("TG_API_ID and TG_API_HASH must be configured in .env")
+            
+            # 只有在既没有全局配置也没有 Pool 的情况下才报错
+            if (not api_id or not api_hash) and not CONFIG.TG_API_KEYS:
+                raise RuntimeError("TG_API_ID and TG_API_HASH must be configured in .env, or provide TG_API_KEYS")
+            
             self.managers[account] = AccountClientManager(session_name, api_id, api_hash)
         return self.managers[account]
 
