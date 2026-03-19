@@ -2,7 +2,8 @@ import asyncio
 from typing import List, Optional
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, User
+from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
 from app.config import CONFIG
@@ -433,14 +434,19 @@ Group inquiries or direct DM
         disable_web_page_preview: bool,
     ) -> tuple[bool, Optional[str], Optional[int]]:
         await self.ensure_connected()
+        try:
+            ent = await self.client.get_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(ent, User):
+            return False, "peer_is_user", None
         pm = None
         if parse_mode == "markdown":
             pm = "markdown"
         elif parse_mode == "html":
             pm = "html"
-            
         async def _do_send(entity):
-             return await self.client.send_message(
+            return await self.client.send_message(
                 entity=entity,
                 message=text,
                 parse_mode=pm,
@@ -451,6 +457,10 @@ Group inquiries or direct DM
             msg = await _do_send(group_id)
             mid = getattr(msg, 'id', None)
             return True, None, mid
+        except ChatWriteForbiddenError:
+            return False, "chat_write_forbidden", None
+        except UserBannedInChannelError:
+            return False, "user_banned_in_channel", None
         except Exception as e:
             # Handle "Invalid Peer" or "Could not find input entity"
             # This happens when the entity is not in the local cache/session file

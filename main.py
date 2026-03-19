@@ -76,22 +76,30 @@ async def list_accounts_status(request: Request):
     token = request.headers.get("X-Admin-Token")
     if token != CONFIG.ADMIN_TOKEN:
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
-    prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
-    prefix_names = [f"{prefix}_{i:02d}" for i in range(1, count + 1)]
-    prefix_set = set(prefix_names)
-    extra_names = [n for n in _discover_session_accounts() if n not in prefix_set]
-    names = prefix_names + extra_names
-    data = []
-    
     session_dir = CONFIG.SESSION_DIR
+    discovered = _discover_session_accounts()
+    names: list[str] = list(discovered)
+    seen = set(names)
+    db: Session = SessionLocal()
+    try:
+        running_rows = db.query(Task.account_name).filter(Task.status == "running").all()
+    finally:
+        db.close()
+    for row in running_rows:
+        acc = (row[0] or "").strip()
+        if acc and acc not in seen:
+            names.append(acc)
+            seen.add(acc)
+    if not names:
+        for name in list(getattr(CONFIG, "ACCOUNTS", {}).keys()):
+            n = (name or "").strip()
+            if n and n not in seen:
+                names.append(n)
+                seen.add(n)
+    data = []
     for name in names:
-        # Optimization: Check file existence instead of connecting to Telegram
-        # This is much faster for large number of accounts
         session_path = os.path.join(session_dir, f"{name}.session")
-        authorized = os.path.exists(session_path)
-        # Always append the account, regardless of authorization status
-        data.append({"account": name, "authorized": authorized})
+        data.append({"account": name, "authorized": os.path.exists(session_path)})
     return JSONResponse(data)
 
 
@@ -277,6 +285,38 @@ async def bulk_delete_accounts(request: Request):
                 }
             )
         return JSONResponse({"results": results})
+    finally:
+        db.close()
+
+@app.route("/api/task-control", methods=["POST"])
+async def task_control(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    task_id = body.get("task_id")
+    action = body.get("action")
+    if not task_id or action not in ("pause", "resume", "stop"):
+        return JSONResponse({"detail": "bad_request"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        t = db.query(Task).filter(Task.id == task_id).first()
+        if not t:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        if action == "pause":
+            t.paused = 1
+            db.add(TaskEvent(task_id=task_id, event="paused", detail="task_paused", meta_json=json.dumps({}, ensure_ascii=False)))
+        elif action == "resume":
+            t.paused = 0
+            db.add(TaskEvent(task_id=task_id, event="resumed", detail="task_resumed", meta_json=json.dumps({}, ensure_ascii=False)))
+        elif action == "stop":
+            t.stop_requested = 1
+            db.add(TaskEvent(task_id=task_id, event="stop_requested", detail="task_stop_requested", meta_json=json.dumps({}, ensure_ascii=False)))
+        db.commit()
+        return JSONResponse({"ok": True})
     finally:
         db.close()
 
@@ -635,6 +675,25 @@ async def export_logs_csv(request: Request):
         db.close()
 
 
+@app.route("/api/logs/clear", methods=["POST"])
+async def clear_logs(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    db: Session = SessionLocal()
+    try:
+        deleted = db.query(SendLog).delete()
+        db.commit()
+        return JSONResponse({"deleted": int(deleted)})
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return JSONResponse({"detail": str(e)}, status_code=500)
+    finally:
+        db.close()
+
 async def startup_event():
     print("[STARTUP] Event triggered")
     Base.metadata.create_all(bind=engine)
@@ -708,6 +767,7 @@ async def startup_event():
     
     # 启动定期清理空闲连接的后台任务
     asyncio.create_task(_periodic_connection_cleanup())
+    asyncio.create_task(_periodic_task_cleanup())
 
     db: Session = SessionLocal()
     try:
@@ -748,11 +808,39 @@ _LAST_TS: dict[str, float] = {}
 
 
 async def _periodic_connection_cleanup():
-    """定期清理空闲的 Telegram 连接以节省内存"""
     while True:
         try:
-            await asyncio.sleep(60)  # 每分钟检查一次
+            await asyncio.sleep(60)
             await multi_manager._cleanup_idle_connections()
+        except Exception as e:
+            print(f"[CLEANUP] Error: {e}")
+
+async def _periodic_task_cleanup():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            db: Session = SessionLocal()
+            try:
+                now = CONFIG.now()
+                timeout_s = int(getattr(CONFIG, "TASK_STUCK_TIMEOUT_S", 900))
+                rows = db.query(Task).filter(Task.status == "running").limit(200).all()
+                for t in rows:
+                    hb = t.heartbeat_at or t.started_at
+                    if hb:
+                        if hb.tzinfo is None:
+                            now_cmp = datetime.utcnow()
+                        else:
+                            now_cmp = now
+                            if now_cmp.tzinfo is None:
+                                now_cmp = now_cmp.replace(tzinfo=hb.tzinfo)
+                    if hb and (now_cmp - hb).total_seconds() > timeout_s:
+                        t.status = "error"
+                        t.stop_requested = 1
+                        t.finished_at = now
+                        db.add(TaskEvent(task_id=t.id, event="stuck_timeout", detail=str(timeout_s), meta_json=json.dumps({}, ensure_ascii=False)))
+                db.commit()
+            finally:
+                db.close()
         except Exception as e:
             print(f"[CLEANUP] Error: {e}")
 

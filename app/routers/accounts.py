@@ -76,8 +76,14 @@ async def check_single_account(request: Request):
     except:
          return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
     
-    result = await account_service.check_account(account)
-    return JSONResponse(result)
+    try:
+        result = await account_service.check_account(account)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse(
+            {"account": account, "status": "error", "valid": False, "detail": str(e)[:120]},
+            status_code=200,
+        )
 
 async def delete_account(request: Request):
     token = request.headers.get("X-Admin-Token")

@@ -73,7 +73,7 @@ class Settings:
         self.SESSION_DIR = os.getenv("SESSION_DIR", ".")
         self.SEND_RETRY_MAX = int(os.getenv("SEND_RETRY_MAX", "2"))
         self.SEND_RETRY_DELAY_MS = int(os.getenv("SEND_RETRY_DELAY_MS", "1500"))
-        self.SEND_MIN_DELAY_MS = int(os.getenv("SEND_MIN_DELAY_MS", "1500"))
+        self.SEND_MIN_DELAY_MS = int(os.getenv("SEND_MIN_DELAY_MS", "11000"))
         try:
             self.SEND_JITTER_PCT = float(os.getenv("SEND_JITTER_PCT", "0.15"))
         except Exception:
