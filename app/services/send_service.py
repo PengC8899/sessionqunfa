@@ -8,6 +8,7 @@ from app.telegram_client import MultiTelegramManager
 from app.models import SendLog, Task, TaskEvent
 from app.config import CONFIG
 from app.services.send_scheduler import SendScheduler
+from app.services.group_service import get_banned_group_ids, add_banned_group
 
 
 _SEND_CACHE: dict[str, float] = {}
@@ -48,6 +49,12 @@ async def send_to_groups(
 ):
     use_sched = bool(getattr(CONFIG, "SCHEDULER_ENABLED", 1))
     ids = list(group_ids)
+    try:
+        banned = set(get_banned_group_ids(db, account))
+        if banned:
+            ids = [g for g in ids if g not in banned]
+    except Exception:
+        pass
     if use_sched:
         sched = SendScheduler(db)
         grading = sched.grade_groups(ids)
@@ -110,10 +117,34 @@ async def send_to_groups(
                 )
                 if ok:
                     break
-                attempt += 1
-                if attempt <= retry_max:
-                    await asyncio.sleep(max(retry_delay_ms, 0) / 1000.0)
+                
+                # 处理 FloodWait 错误
+                if err and "FloodWait" in str(err):
+                    wait_seconds = 60
+                    try:
+                        if ":" in str(err):
+                            wait_seconds = int(str(err).split(":")[1])
+                        else:
+                            wait_seconds = int(''.join(filter(str.isdigit, str(err)[:20]))) or 60
+                    except:
+                        pass
+                    # 如果需要等待时间太长，直接跳过重试
+                    if wait_seconds > 300:
+                        break
+                    await asyncio.sleep(wait_seconds)
+                else:
+                    attempt += 1
+                    if attempt <= retry_max:
+                        await asyncio.sleep(max(retry_delay_ms, 0) / 1000.0)
+                        
             status = "success" if ok else "failed"
+            if not ok and err:
+                e_low = str(err).lower()
+                if "banned from sending messages" in e_low or "chat_write_forbidden" in e_low or "chat_send_plain_forbidden" in e_low or "chat_send_media_forbidden" in e_low:
+                    try:
+                        add_banned_group(db, account, gid)
+                    except Exception:
+                        pass
             if status == "success":
                 success += 1
             elif status == "failed":

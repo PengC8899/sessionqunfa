@@ -158,7 +158,11 @@ class MultiAccountSender:
                     if err and "FloodWait" in str(err):
                         # 解析等待时间
                         try:
-                            wait_seconds = int(''.join(filter(str.isdigit, str(err)[:20]))) or 60
+                            # e.g., "FloodWait:45"
+                            if ":" in str(err):
+                                wait_seconds = int(str(err).split(":")[1])
+                            else:
+                                wait_seconds = int(''.join(filter(str.isdigit, str(err)[:20]))) or 60
                         except:
                             wait_seconds = 60
                         state.flood_wait_until = time.monotonic() + wait_seconds
@@ -285,6 +289,9 @@ class MultiAccountSender:
                     if task_id:
                         async with db_lock:
                             t = db.query(Task).filter(Task.id == task_id).first()
+                            if not t:
+                                stop_flag = True
+                                return
                             if t and t.stop_requested:
                                 stop_flag = True
                                 return

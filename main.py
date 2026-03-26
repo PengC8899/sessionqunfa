@@ -102,6 +102,8 @@ async def list_accounts_status(request: Request):
         data.append({"account": name, "authorized": os.path.exists(session_path)})
     return JSONResponse(data)
 
+app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=["POST"])
+
 
 @app.route("/api/accounts/authorized-list")
 async def list_authorized_accounts(request: Request):
@@ -1204,6 +1206,62 @@ async def task_events(request: Request):
     finally:
         db.close()
 
+@app.route("/api/task-control", methods=["POST"])
+async def task_control(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    task_id = body.get("task_id")
+    action = (body.get("action") or "").strip().lower()
+    if not task_id or action not in ("pause", "resume", "stop"):
+        return JSONResponse({"detail": "bad_request"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        t = db.query(Task).filter(Task.id == task_id).first()
+        if not t:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        if action == "pause":
+            t.paused = 1
+            db.add(TaskEvent(task_id=task_id, event="paused", detail="task_paused", meta_json=json.dumps({}, ensure_ascii=False)))
+        elif action == "resume":
+            t.paused = 0
+            db.add(TaskEvent(task_id=task_id, event="resumed", detail="task_resumed", meta_json=json.dumps({}, ensure_ascii=False)))
+        elif action == "stop":
+            t.stop_requested = 1
+            db.add(TaskEvent(task_id=task_id, event="stop_requested", detail="task_stop_requested", meta_json=json.dumps({}, ensure_ascii=False)))
+        db.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        db.close()
+
+@app.route("/api/tasks/stop-all", methods=["POST"])
+async def stop_all_tasks(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    account = (body.get("account") or "").strip()
+    db: Session = SessionLocal()
+    try:
+        q = db.query(Task).filter(Task.status == "running")
+        if account:
+            q = q.filter(Task.account_name == account)
+        rows = q.all()
+        for t in rows:
+            t.stop_requested = 1
+            db.add(TaskEvent(task_id=t.id, event="stop_requested", detail="task_stop_requested", meta_json=json.dumps({"account": t.account_name}, ensure_ascii=False)))
+        db.commit()
+        return JSONResponse({"ok": True, "tasks_marked": len(rows), "account": account or None})
+    finally:
+        db.close()
+
 
 async def _run_send_task_with_delay(
     task_id: str,
@@ -1238,7 +1296,10 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             # --- Round Setup ---
             with SessionLocal() as db:
                 t = db.query(Task).filter(Task.id == task_id).first()
-                if t:
+                if not t:
+                    print(f"[TASK] {account}: Task record missing, terminating task loop")
+                    return
+                else:
                     t.current_round = current_round
                     if i != start_round_idx:
                         t.current_index = 0
@@ -1268,6 +1329,11 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 with SessionLocal() as db:
                     t = db.query(Task).filter(Task.id == task_id).first()
                     
+                    # If task row has been deleted (e.g., system reset), terminate immediately
+                    if not t:
+                        print(f"[TASK] {account}: Task record deleted, stopping immediately")
+                        return
+                    
                     # Check stop/pause
                     if t and t.stop_requested:
                         print(f"[TASK] {account}: Stop requested")
@@ -1286,12 +1352,13 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         t = db.query(Task).filter(Task.id == task_id).first()
                     
                     # Check again after pause loop
-                    if t and t.stop_requested:
+                    if not t or (t and t.stop_requested):
                         print(f"[TASK] {account}: Stop requested after pause")
-                        t.status = "stopped"
-                        t.finished_at = CONFIG.now()
-                        db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
-                        db.commit()
+                        if t:
+                            t.status = "stopped"
+                            t.finished_at = CONFIG.now()
+                            db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
+                            db.commit()
                         return
 
                     # Send Logic
@@ -1902,6 +1969,12 @@ async def join_groups_batch(request: Request):
     }
     
     return JSONResponse({"summary": summary, "results": results})
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("[SHUTDOWN] Closing all Telegram connections...")
+    await multi_manager.disconnect_all()
+    print("[SHUTDOWN] Cleanup complete.")
 
 
 @app.route("/api/groups/join-all-accounts", methods=["POST"])
