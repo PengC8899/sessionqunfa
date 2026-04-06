@@ -1,5 +1,6 @@
 import random
 import re
+from datetime import datetime, timezone
 from typing import List, Dict, Tuple
 from sqlalchemy.orm import Session
 from app.models import SendLog
@@ -141,3 +142,159 @@ def recent_fail_rate(db: Session, account: str, window: int) -> float:
     s, f = _recent_account_stats(db, account, window)
     n = max(1, s + f)
     return f / n
+
+
+def unique_group_ids(group_ids: List[int]) -> List[int]:
+    seen = set()
+    res: List[int] = []
+    for gid in group_ids:
+        try:
+            value = int(gid)
+        except Exception:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        res.append(value)
+    return res
+
+
+def _latest_group_activity_map(db: Session, group_ids: List[int]) -> Dict[int, datetime]:
+    rows = (
+        db.query(SendLog)
+        .filter(SendLog.group_id.in_(group_ids))
+        .order_by(SendLog.created_at.desc())
+        .all()
+    )
+    latest: Dict[int, datetime] = {}
+    for row in rows:
+        gid = int(row.group_id)
+        if gid not in latest and row.created_at is not None:
+            latest[gid] = row.created_at
+    return latest
+
+
+def filter_groups_by_global_cooldown(db: Session, group_ids: List[int], cooldown_s: int) -> List[int]:
+    ids = unique_group_ids(group_ids)
+    if cooldown_s <= 0 or not ids:
+        return ids
+    now = CONFIG.now()
+    latest = _latest_group_activity_map(db, ids)
+    res: List[int] = []
+    for gid in ids:
+        ts = latest.get(gid)
+        if ts is None:
+            res.append(gid)
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=now.tzinfo or timezone.utc)
+        age = (now - ts).total_seconds()
+        if age >= cooldown_s:
+            res.append(gid)
+    return res
+
+
+def sort_groups_for_account(db: Session, account: str, group_ids: List[int]) -> List[int]:
+    ids = unique_group_ids(group_ids)
+    if not ids:
+        return []
+    account_rows = (
+        db.query(SendLog)
+        .filter(SendLog.account_name == account, SendLog.group_id.in_(ids))
+        .order_by(SendLog.created_at.desc())
+        .all()
+    )
+    account_latest: Dict[int, datetime] = {}
+    for row in account_rows:
+        gid = int(row.group_id)
+        if gid not in account_latest and row.created_at is not None:
+            account_latest[gid] = row.created_at
+    global_latest = _latest_group_activity_map(db, ids)
+    rng = random.Random(f"{account}:{len(ids)}")
+    jitter = {gid: rng.random() for gid in ids}
+    return sorted(
+        ids,
+        key=lambda gid: (
+            account_latest.get(gid) is not None,
+            account_latest.get(gid) or datetime.min,
+            global_latest.get(gid) is not None,
+            global_latest.get(gid) or datetime.min,
+            jitter[gid],
+        ),
+    )
+
+
+def distribute_groups_unique(db: Session, accounts: List[str], group_ids: List[int]) -> Dict[str, List[int]]:
+    accounts = [a for a in accounts if a]
+    distribution: Dict[str, List[int]] = {acc: [] for acc in accounts}
+    ids = unique_group_ids(group_ids)
+    if not accounts or not ids:
+        return distribution
+
+    sorted_groups = ids
+    global_latest = _latest_group_activity_map(db, sorted_groups)
+    roles = {acc: classify_account(db, acc) for acc in accounts}
+    weight_map = {
+        "SAFE": float(getattr(CONFIG, "SAFE_ACCOUNT_GROUP_WEIGHT", 1.25)),
+        "CORE": float(getattr(CONFIG, "CORE_ACCOUNT_GROUP_WEIGHT", 1.0)),
+        "RISK": float(getattr(CONFIG, "RISK_ACCOUNT_GROUP_WEIGHT", 0.6)),
+    }
+    weights = {acc: max(0.1, weight_map.get(roles.get(acc, "CORE"), 1.0)) for acc in accounts}
+    total_weight = sum(weights.values()) or float(len(accounts))
+    raw_targets = {acc: (len(sorted_groups) * weights[acc] / total_weight) for acc in accounts}
+    targets = {acc: int(raw_targets[acc]) for acc in accounts}
+    assigned = sum(targets.values())
+    if assigned < len(sorted_groups):
+        remainders = sorted(
+            accounts,
+            key=lambda acc: (raw_targets[acc] - targets[acc], weights[acc]),
+            reverse=True,
+        )
+        for acc in remainders[: len(sorted_groups) - assigned]:
+            targets[acc] += 1
+    elif assigned > len(sorted_groups):
+        remainders = sorted(accounts, key=lambda acc: (raw_targets[acc] - targets[acc], weights[acc]))
+        overflow = assigned - len(sorted_groups)
+        for acc in remainders:
+            if overflow <= 0:
+                break
+            if targets[acc] > 0:
+                targets[acc] -= 1
+                overflow -= 1
+
+    account_latest: Dict[str, Dict[int, datetime]] = {}
+    account_rows = (
+        db.query(SendLog)
+        .filter(SendLog.account_name.in_(accounts), SendLog.group_id.in_(sorted_groups))
+        .order_by(SendLog.created_at.desc())
+        .all()
+    )
+    for row in account_rows:
+        acc = row.account_name
+        gid = int(row.group_id)
+        if acc not in account_latest:
+            account_latest[acc] = {}
+        if gid not in account_latest[acc] and row.created_at is not None:
+            account_latest[acc][gid] = row.created_at
+
+    sorted_groups = sorted(
+        sorted_groups,
+        key=lambda gid: (
+            global_latest.get(gid) is not None,
+            global_latest.get(gid) or datetime.min,
+        ),
+    )
+
+    for gid in sorted_groups:
+        best_acc = min(
+            accounts,
+            key=lambda acc: (
+                gid in account_latest.get(acc, {}),
+                len(distribution[acc]) / max(targets.get(acc, 1), 1),
+                len(distribution[acc]) >= targets.get(acc, 0),
+                account_latest.get(acc, {}).get(gid) or datetime.min,
+                weights[acc] <= 1.0,
+            ),
+        )
+        distribution[best_acc].append(gid)
+    return distribution

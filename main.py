@@ -17,7 +17,7 @@ from app.services.group_service import get_groups, clear_group_cache
 from app.routers.accounts import check_single_account, delete_account, bulk_update_profile
 from app.routers.system import reset_system
 from app.services.account_service import account_service
-from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate
+from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate, unique_group_ids, sort_groups_for_account, distribute_groups_unique
 import json
 import time
 import uuid
@@ -996,6 +996,7 @@ async def send_async(request: Request):
         authorized = False
     if not authorized:
         return JSONResponse({"detail": "session_not_authorized"}, status_code=403)
+    group_ids = unique_group_ids(group_ids)
     if not group_ids or not message:
         return JSONResponse({"detail": "group_ids and message required"}, status_code=400)
     task_id = uuid.uuid4().hex[:24]
@@ -1288,6 +1289,25 @@ async def _run_send_task_with_delay(
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int, start_round_idx: int = 0, start_group_idx: int = 0):
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = int(getattr(CONFIG, "MAX_CONSECUTIVE_FAILURES", 10))
+
+    def _should_defer_group(error_text: str | None) -> bool:
+        if not error_text:
+            return True
+        err = str(error_text).lower()
+        hard_fail_markers = (
+            "banned from sending messages",
+            "user_banned_in_channel",
+            "chat_write_forbidden",
+            "chat_send_plain_forbidden",
+            "chat_send_media_forbidden",
+            "peer error",
+            "invalid peer",
+            "could not find the input entity",
+            "channel_private",
+            "session database corrupted",
+            "not authorized",
+        )
+        return not any(marker in err for marker in hard_fail_markers)
     
     try:
         for i in range(start_round_idx, rounds):
@@ -1312,6 +1332,9 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 else:
                     ids = list(group_ids)
                     random.shuffle(ids)
+                ids = unique_group_ids(ids)
+                ids = sort_groups_for_account(db, account, ids)
+            deferred_once: set[int] = set()
             
             # Resumption logic: skip groups if restarting in the middle of a round
             if i == start_round_idx and start_group_idx > 0:
@@ -1408,6 +1431,16 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         else:
                             t.failed = (t.failed or 0) + 1
                             consecutive_failures += 1
+                            if gid not in deferred_once and _should_defer_group(err):
+                                ids.append(gid)
+                                deferred_once.add(gid)
+                                t.total = (t.total or 0) + 1
+                                db.add(TaskEvent(
+                                    task_id=task_id,
+                                    event="deferred",
+                                    detail="group_deferred_to_tail",
+                                    meta_json=json.dumps({"gid": gid, "error": err}, ensure_ascii=False),
+                                ))
                         
                         t.current_index = (t.current_index or 0) + 1
                         t.heartbeat_at = CONFIG.now()
@@ -1732,6 +1765,7 @@ async def send_multi_account(request: Request):
     if not ok:
         return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
     
+    group_ids = unique_group_ids(group_ids)
     if not group_ids or not message:
         return JSONResponse({"detail": "group_ids and message required"}, status_code=400)
     
@@ -1753,17 +1787,26 @@ async def send_multi_account(request: Request):
     if not accounts:
         return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
     
-    # 直接使用有 session 文件的账号，授权检查在发送时进行（更快）
-    # 为每个账号创建单独的任务
+    # 先按“群唯一分配 + 全局冷却 + 尽量避免同号重复打同群”生成计划
+    db: Session = SessionLocal()
+    try:
+        planned_distribution = distribute_groups_unique(db, accounts, group_ids)
+    finally:
+        db.close()
+
+    # 为每个账号创建单独任务，但每个账号只拿到自己那一份群
     task_ids = []
     db: Session = SessionLocal()
     try:
         for acc in accounts:
+            acc_group_ids = planned_distribution.get(acc, [])
+            if not acc_group_ids:
+                continue
             task_id = uuid.uuid4().hex[:24]
             t = Task(
                 id=task_id,
                 status="running",
-                total=len(group_ids),
+                total=len(acc_group_ids),
                 success=0,
                 failed=0,
                 account_name=acc,  # 单个账号名
@@ -1774,7 +1817,7 @@ async def send_multi_account(request: Request):
                 rounds=rounds,
                 round_interval_s=round_interval_s,
                 current_index=0,
-                group_ids_json=json.dumps(group_ids),
+                group_ids_json=json.dumps(acc_group_ids),
                 request_id=request_id,
             )
             db.add(t)
@@ -1782,12 +1825,18 @@ async def send_multi_account(request: Request):
                 task_id=task_id, 
                 event="created", 
                 detail="task_created",
-                meta_json=json.dumps({"count": len(group_ids)}, ensure_ascii=False)
+                meta_json=json.dumps({"count": len(acc_group_ids)}, ensure_ascii=False)
             ))
-            task_ids.append({"account": acc, "task_id": task_id})
+            task_ids.append({"account": acc, "task_id": task_id, "group_ids": acc_group_ids})
         db.commit()
     finally:
         db.close()
+
+    if not task_ids:
+        return JSONResponse({
+            "detail": "no_groups_available_after_planning",
+            "message": "当前群都在冷却期内，暂时不安排重复发送",
+        }, status_code=400)
     
     if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
         db2: Session = SessionLocal()
@@ -1812,7 +1861,7 @@ async def send_multi_account(request: Request):
                 asyncio.create_task(_run_send_task_with_delay(
                     task_id=it["task_id"],
                     account=it["account"],
-                    group_ids=group_ids,
+                    group_ids=it["group_ids"],
                     message=message,
                     parse_mode=parse_mode,
                     disable_web_page_preview=disable_web_page_preview,
@@ -1831,7 +1880,7 @@ async def send_multi_account(request: Request):
             asyncio.create_task(_run_send_task_with_delay(
                 task_id=item["task_id"],
                 account=item["account"],
-                group_ids=group_ids,
+                group_ids=item["group_ids"],
                 message=message,
                 parse_mode=parse_mode,
                 disable_web_page_preview=disable_web_page_preview,
@@ -1844,6 +1893,9 @@ async def send_multi_account(request: Request):
     return JSONResponse({
         "tasks": task_ids,
         "accounts_count": len(accounts),
+        "planned_groups": sum(len(it["group_ids"]) for it in task_ids),
+        "unique_groups": len(group_ids),
+        "strategy": "unique_group_rotation",
         "stagger_min_s": stagger_min_s,
         "stagger_max_s": stagger_max_s,
     })
