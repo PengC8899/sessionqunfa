@@ -28,12 +28,12 @@ function saveToken() {
   localStorage.setItem('adminToken', t);
   const el = document.getElementById('tokenStatus');
   if (!t) {
-    if (el) { el.textContent = '请输入令牌'; el.className = 'status-error'; }
+    if (el) { el.textContent = '请输入令牌'; el.className = 'workspace-status text-sm status-error'; }
     alert('请输入令牌');
     return;
   }
   // Remove "pc-20251206-7575" legacy token check if needed, but for now just save what user typed
-  if (el) { el.textContent = '令牌已保存'; el.className = 'status-success'; }
+  if (el) { el.textContent = '令牌已保存'; el.className = 'workspace-status text-sm status-success'; }
   localStorage.setItem('tokenLocked', '1');
   updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
 }
@@ -67,6 +67,31 @@ function renderGroupsFromCacheIfAvailable() {
   }
 }
 
+function updateText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function renderOverview() {
+  const selectedCount = state.selectedIds.size;
+  const currentAccount = state.account || '未选择';
+  updateText('overviewAccount', currentAccount);
+  updateText('miniCurrentAccount', currentAccount);
+  updateText('overviewSelectedCount', String(selectedCount));
+  updateText('miniSelectedCount', String(selectedCount));
+  updateText('miniChannelMode', state.includeChannels ? '包含频道' : '仅群组');
+}
+
+function updateAuthOverview(authorized) {
+  const authText = authorized ? '已授权' : '未授权';
+  updateText('overviewAuth', authText);
+  updateText('miniAuthState', authText);
+  const overviewAuth = document.getElementById('overviewAuth');
+  const miniAuthState = document.getElementById('miniAuthState');
+  if (overviewAuth) overviewAuth.className = authorized ? 'status-success' : 'status-error';
+  if (miniAuthState) miniAuthState.className = authorized ? 'status-success' : 'status-error';
+}
+
 function renderGlobalSummary() {
   const tbody = document.getElementById('globalSummaryBody');
   if (!tbody) return;
@@ -76,16 +101,23 @@ function renderGlobalSummary() {
     const total = Math.max(0, parseInt(r.total || 0));
     const succ = Math.max(0, parseInt(r.success || 0));
     const fail = Math.max(0, parseInt(r.failed || 0));
-    const pct = total > 0 ? Math.round((succ / total) * 100) : 0;
-    const barColor = pct >= 80 ? '#52c41a' : (pct >= 50 ? '#1890ff' : '#f5222d');
-    const progressBar = `<div style="width:100%; background:#f0f0f0; height:6px; border-radius:3px; overflow:hidden;"><div style="width:${pct}%; height:6px; background:${barColor}; transition:width 0.3s;"></div></div> <div style="font-size:11px; color:#888; text-align:right;">${pct}%</div>`;
+    const processed = Math.max(0, parseInt((r.processed != null ? r.processed : (succ + fail)) || 0));
+    const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td>${r.account}</td>
-      <td>${progressBar}</td>
-      <td class="status-success">${succ}</td>
-      <td class="status-error">${fail}</td>
-      <td>${(r.current_round||0)}/${(r.rounds||0)}</td>
+      <td><div style="font-weight:600; color:var(--primary-color);">${r.account}</div></td>
+      <td>
+        <div class="progress-container">
+          <div class="progress-bar" style="width:${pct}%"></div>
+        </div>
+        <div style="font-size:10px; color:var(--text-secondary); margin-top:2px; display:flex; justify-content:space-between;">
+          <span>${processed}/${total}</span>
+          <span>${pct}%</span>
+        </div>
+      </td>
+      <td class="status-success" style="font-weight:600;">${succ}</td>
+      <td class="status-error" style="font-weight:600;">${fail}</td>
+      <td style="font-size:11px; color:var(--text-secondary);">${(r.current_round||0)}/${(r.rounds||0)}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -103,8 +135,10 @@ function sortSummary(key) {
   state.summarySortKey = key; state.summarySortAsc = asc;
   const arr = (state.summary || []).slice();
   arr.sort((a,b) => {
-    const va = (key === 'progress') ? ((a.total||0) ? (a.success||0)/(a.total||0) : 0) : (a[key] || 0);
-    const vb = (key === 'progress') ? ((b.total||0) ? (b.success||0)/(b.total||0) : 0) : (b[key] || 0);
+    const aProcessed = (a.processed != null) ? (a.processed || 0) : ((a.success || 0) + (a.failed || 0));
+    const bProcessed = (b.processed != null) ? (b.processed || 0) : ((b.success || 0) + (b.failed || 0));
+    const va = (key === 'progress') ? ((a.total||0) ? aProcessed/(a.total||0) : 0) : (a[key] || 0);
+    const vb = (key === 'progress') ? ((b.total||0) ? bProcessed/(b.total||0) : 0) : (b[key] || 0);
     if (typeof va === 'string' || typeof vb === 'string') return asc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
     return asc ? (va - vb) : (vb - va);
   });
@@ -205,6 +239,7 @@ async function fetchAccounts() {
   state.account = saved && state.accounts.includes(saved) ? saved : (state.accounts[0] || '');
   sel.value = state.account;
   localStorage.setItem('selectedAccount', state.account);
+  renderOverview();
 }
 
 function renderGroups() {
@@ -212,7 +247,7 @@ function renderGroups() {
   ul.innerHTML = '';
   state.filteredGroups.forEach(g => {
     const li = document.createElement('li');
-    li.className = 'group-item';
+    li.className = `group-item ${state.selectedIds.has(g.id) ? 'selected' : ''}`;
     const badge = g.is_channel ? '频道' : (g.is_megagroup ? '超级群' : '群');
     const checked = state.selectedIds.has(g.id) ? 'checked' : '';
     const disabled = (g.is_channel && !g.is_megagroup) ? 'disabled' : '';
@@ -233,6 +268,7 @@ function renderGroups() {
     ul.appendChild(li);
   });
   document.getElementById('groupCount').textContent = `共 ${state.filteredGroups.length} 项`;
+  renderOverview();
 }
 
 function filterGroups() {
@@ -248,10 +284,13 @@ function filterGroups() {
 function setAll(selected) {
   document.querySelectorAll('.groupCheck').forEach(ch => { 
     ch.checked = selected; 
+    const item = ch.closest('.group-item');
+    if (item) item.classList.toggle('selected', selected);
     const id = parseInt(ch.value);
     if (selected) state.selectedIds.add(id); else state.selectedIds.delete(id);
   });
   persistSelected();
+  renderOverview();
 }
 
 function getSelectedIds() {
@@ -280,7 +319,7 @@ async function send(path) {
   const parseMode = document.getElementById('parseMode').value;
   const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
   const rounds = parseInt(document.getElementById('rounds')?.value || '100');
-  const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '600');
+  const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
   if (!msg.trim()) { alert('消息不能为空'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
@@ -361,22 +400,64 @@ async function fetchLogs() {
   });
   if (!res.ok) return;
   const data = await res.json();
+  updateText('overviewLogCount', String(Array.isArray(data) ? data.length : 0));
   const tbody = document.getElementById('logsBody');
   tbody.innerHTML = '';
   data.forEach(r => {
+    const status = (r.status || '').toLowerCase();
+    const statusClass = status === 'success'
+      ? 'log-status-success'
+      : (status === 'failed' ? 'log-status-failed' : 'log-status-info');
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td style="color:var(--text-muted); font-size:12px;">${r.created_at || ''}</td>
-      <td style="font-size:12px;">${r.account_name || ''}</td>
-      <td>${r.group_title || r.group_id}</td>
-      <td class="${r.status === 'success' ? 'status-success' : 'status-error'}">${r.status}</td>
-      <td style="font-size:12px;">${r.error || r.message_id || ''}</td>
+      <td style="color:var(--text-muted); font-size:11px;">${r.created_at ? r.created_at.split(' ')[1] : ''}</td>
+      <td style="font-size:11px; font-weight:500;">${r.account_name || ''}</td>
+      <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.group_title || r.group_id}</td>
+      <td><span class="log-status ${statusClass}">${r.status || '-'}</span></td>
+      <td style="font-size:11px; color:var(--text-secondary); max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.error || r.message_id || ''}</td>
     `;
     tbody.appendChild(tr);
   });
 }
 
 function bindEvents() {
+  // 响应式侧边栏切换
+  const menuToggle = document.getElementById('menuToggle');
+  const sidebar = document.getElementById('sidebar');
+  const sidebarOverlay = document.getElementById('sidebarOverlay');
+  
+  if (menuToggle && sidebar && sidebarOverlay) {
+    const toggleSidebar = () => {
+      sidebar.classList.toggle('active');
+      sidebarOverlay.classList.toggle('active');
+    };
+    
+    menuToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleSidebar();
+    });
+    
+    sidebarOverlay.addEventListener('click', toggleSidebar);
+    
+    // 手机端点击群组后自动收起侧边栏
+    document.getElementById('groupList').addEventListener('click', (e) => {
+      if (window.innerWidth <= 768 && e.target.closest('.group-item')) {
+        // 延迟一小会儿收起，让用户看到点击效果
+        setTimeout(toggleSidebar, 150);
+      }
+    });
+  }
+
+  document.querySelectorAll('.workspace-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const target = tab.getAttribute('data-workspace');
+      document.querySelectorAll('.workspace-tab').forEach((el) => el.classList.toggle('active', el === tab));
+      document.querySelectorAll('.workspace-section').forEach((section) => {
+        section.classList.toggle('active', section.id === target);
+      });
+    });
+  });
+
   document.getElementById('saveToken').addEventListener('click', () => { saveToken(); fetchAccounts(); fetchAuthStatus(); fetchGroups(true); fetchLogs(); });
   
   // Login Popover Toggle
@@ -410,7 +491,7 @@ function bindEvents() {
       localStorage.setItem('tokenLocked', '0');
       updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
       const el = document.getElementById('tokenStatus');
-      if (el) { el.textContent = '已解锁'; el.className = ''; }
+      if (el) { el.textContent = '已解锁'; el.className = 'workspace-status text-sm'; }
     });
   }
   document.getElementById('searchInput').addEventListener('input', filterGroups);
@@ -466,7 +547,10 @@ function bindEvents() {
     if (e.target && e.target.classList.contains('groupCheck')) {
       const id = parseInt(e.target.value);
       if (e.target.checked) state.selectedIds.add(id); else state.selectedIds.delete(id);
+      const item = e.target.closest('.group-item');
+      if (item) item.classList.toggle('selected', e.target.checked);
       persistSelected();
+      renderOverview();
     }
   });
   document.getElementById('sendBtn').addEventListener('click', () => send('send'));
@@ -529,9 +613,10 @@ function restoreIncludeChannels() {
 
 window.addEventListener('DOMContentLoaded', async () => {
   loadToken();
-  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
   restoreSelected();
   restoreIncludeChannels();
+  renderOverview();
+  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
   initAccountCheck();
   bindEvents();
   await fetchAccounts();
@@ -578,8 +663,9 @@ async function fetchAuthStatus() {
   const el = document.getElementById('authStatus');
   if (el) {
     el.textContent = data.authorized ? '已授权' : '未授权';
-    el.className = data.authorized ? 'status-success' : 'status-warning';
+    el.className = data.authorized ? 'status-success' : 'status-error';
   }
+  updateAuthOverview(Boolean(data.authorized));
   // Only hide login inputs if the specific account is authorized
   if (data.authorized) {
     setAccountLocked(true);
@@ -605,21 +691,13 @@ async function clearCache() {
 
 async function clearLogs() {
   if (!state.token) { alert('请输入令牌并点击“保存”'); return; }
-  if (!confirm('确定要清空所有日志吗？此操作不可恢复。')) return;
-  try {
-    const res = await fetch('/api/logs/clear', {
-      method: 'POST',
-      headers: { 'X-Admin-Token': state.token }
-    });
-    if (res.ok) {
-      alert('日志已清空');
-      fetchLogs();
-    } else {
-      const d = await res.json();
-      alert('清空失败: ' + (d.detail || '未知错误'));
-    }
-  } catch (e) {
-    alert('请求出错: ' + e);
+  if (!confirm('确认清空所有发送日志？此操作不可恢复')) return;
+  const res = await fetch('/api/logs/clear', { method: 'POST', headers: { 'X-Admin-Token': state.token } });
+  if (res.ok) {
+    await fetchLogs();
+    alert('日志已清空');
+  } else {
+    alert('清空日志失败');
   }
 }
 
@@ -691,8 +769,8 @@ async function submitLoginCode() {
   }
 }
 
-/* Removed redundant updateTokenLockUI definition that was here */
-function setAccountLocked(locked) {
+/* Reserved for future account-level UI lock state. */
+function setAccountLocked(_locked) {
   // Logic to lock account UI if needed - currently unused or can be removed
 }
 
@@ -791,8 +869,6 @@ async function startCheck() {
       const timeoutController = new AbortController();
       const timeoutId = setTimeout(() => timeoutController.abort(), 20000); // 20秒超时
       
-      // 合并用户停止信号和超时信号
-      const combinedSignal = checkAbortController.signal;
       checkAbortController.signal.addEventListener('abort', () => timeoutController.abort());
       
       const res = await fetch('/api/accounts/check-single', {
@@ -1170,8 +1246,6 @@ async function batchJoinGroups() {
   statusEl.textContent = '正在批量加入群组...';
   
   try {
-    let endpoint, body;
-    
     if (mode === 'all') {
       // 所有账号加入每个群 - 需要逐个群调用
       let successCount = 0;
@@ -1202,6 +1276,7 @@ async function batchJoinGroups() {
           await new Promise(r => setTimeout(r, delayMs));
         }
       }
+      
       statusEl.textContent = `✅ 完成! 成功: ${successCount}, 失败: ${failCount}`;
       statusEl.style.color = 'var(--success-color)';
       
@@ -1638,12 +1713,9 @@ async function uploadProtocolFiles() {
   progressEl.style.color = 'var(--text-muted)';
   
   const formData = new FormData();
-  protocolAccounts = [];
   
   for (const file of fileInput.files) {
     formData.append('files', file);
-    const accountName = file.name.replace('.session', '');
-    protocolAccounts.push(accountName);
   }
   
   try {
@@ -1656,7 +1728,10 @@ async function uploadProtocolFiles() {
     const data = await res.json();
     
     if (res.ok) {
-      progressEl.textContent = `✅ 成功上传 ${data.uploaded} 个文件\n\n账号列表:\n${protocolAccounts.join('\n')}`;
+      // 关键修改：直接使用后端解析出来的实际账号列表，而不是根据文件名盲猜
+      protocolAccounts = data.validated_accounts || [];
+      
+      progressEl.textContent = `✅ 成功解析上传 ${data.uploaded} 个文件\n\n账号列表:\n${protocolAccounts.join('\n')}`;
       progressEl.style.color = 'var(--success-color)';
       
       if (data.errors && data.errors.length > 0) {
@@ -1928,104 +2003,3 @@ async function batchJoinWithProtocols() {
   btn.disabled = false;
   btn.textContent = '🚀 开始批量加入';
 }
-
-// ========== Update Profile ==========
-function setupUpdateProfile() {
-  const updateProfileBtn = document.getElementById('updateProfileBtn');
-  const updateProfileModal = document.getElementById('updateProfileModal');
-  const closeUpdateProfileModal = document.getElementById('closeUpdateProfileModal');
-  const startUpdateProfileBtn = document.getElementById('startUpdateProfileBtn');
-
-  if (updateProfileBtn) {
-    updateProfileBtn.addEventListener('click', () => {
-      updateProfileModal.classList.remove('hidden');
-      document.getElementById('updateProfileStatus').textContent = '';
-    });
-  }
-
-  if (closeUpdateProfileModal) {
-    closeUpdateProfileModal.addEventListener('click', () => {
-      updateProfileModal.classList.add('hidden');
-    });
-  }
-  
-  if (updateProfileModal) {
-    updateProfileModal.addEventListener('click', (e) => {
-        if (e.target === updateProfileModal) {
-            updateProfileModal.classList.add('hidden');
-        }
-    });
-  }
-
-  if (startUpdateProfileBtn) {
-    startUpdateProfileBtn.addEventListener('click', async () => {
-      const firstName = document.getElementById('newFirstName').value.trim();
-      const fileInput = document.getElementById('newAvatarFile');
-      const statusDiv = document.getElementById('updateProfileStatus');
-      
-      if (!firstName) {
-        alert('请输入新昵称');
-        return;
-      }
-      
-      if (!confirm('确定要批量修改所有已登录账号的资料吗？此操作不可逆。')) {
-        return;
-      }
-      
-      statusDiv.textContent = '正在提交请求，请稍候...\n';
-      startUpdateProfileBtn.disabled = true;
-      
-      const formData = new FormData();
-      formData.append('first_name', firstName);
-      if (fileInput.files.length > 0) {
-        formData.append('photo', fileInput.files[0]);
-      }
-      
-      try {
-        const res = await fetch('/api/accounts/bulk-update-profile', {
-          method: 'POST',
-          headers: {
-            'X-Admin-Token': state.token
-          },
-          body: formData
-        });
-        
-        if (!res.ok) {
-          const err = await res.text();
-          statusDiv.textContent += `请求失败: ${err}\n`;
-          return;
-        }
-        
-        const data = await res.json();
-        let successCount = 0;
-        let failCount = 0;
-        let details = '';
-        
-        for (const [account, result] of Object.entries(data)) {
-            if (result.ok) {
-                successCount++;
-                let msg = `[${account}] ✅ 成功`;
-                if (result.details) {
-                    if (result.details.name === false) msg += ` (改名失败: ${result.details.name_error})`;
-                    if (result.details.photo === false) msg += ` (改头像失败: ${result.details.photo_error})`;
-                }
-                details += msg + '\n';
-            } else {
-                failCount++;
-                details += `[${account}] ❌ 失败: ${result.error}\n`;
-            }
-        }
-        
-        statusDiv.textContent = `完成! 成功: ${successCount}, 失败: ${failCount}\n\n详细结果:\n${details}`;
-        
-      } catch (e) {
-        statusDiv.textContent += `发生错误: ${e.message}\n`;
-      } finally {
-        startUpdateProfileBtn.disabled = false;
-      }
-    });
-  }
-}
-
-// Call setup
-setupUpdateProfile();
