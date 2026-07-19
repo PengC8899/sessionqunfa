@@ -8,7 +8,7 @@ from app.telegram_client import MultiTelegramManager
 from app.models import SendLog, Task, TaskEvent
 from app.config import CONFIG
 from app.services.send_scheduler import SendScheduler
-from app.services.group_service import get_banned_group_ids, add_banned_group
+from app.services.group_service import get_banned_group_ids, add_banned_group, should_exclude_group_on_error
 
 
 _SEND_CACHE: dict[str, float] = {}
@@ -139,8 +139,7 @@ async def send_to_groups(
                         
             status = "success" if ok else "failed"
             if not ok and err:
-                e_low = str(err).lower()
-                if "banned from sending messages" in e_low or "chat_write_forbidden" in e_low or "chat_send_plain_forbidden" in e_low or "chat_send_media_forbidden" in e_low:
+                if should_exclude_group_on_error(err):
                     try:
                         add_banned_group(db, account, gid)
                     except Exception:

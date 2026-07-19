@@ -25,6 +25,7 @@ class Settings:
     MULTI_ACCOUNT_ENABLED: int
     MULTI_ACCOUNT_MAX_CONCURRENT: int
     MULTI_ACCOUNT_STAGGER_MS: int
+    RESUME_TASKS_ON_STARTUP: int
     # 调度与风控参数
     SCHEDULER_ENABLED: int
     GROUP_RECENT_WINDOW: int
@@ -94,6 +95,7 @@ class Settings:
         self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "3"))
         # 账号之间的发送间隔 (ms)，防止风控
         self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "5000"))
+        self.RESUME_TASKS_ON_STARTUP = int(os.getenv("RESUME_TASKS_ON_STARTUP", "0"))
         self.SCHEDULER_ENABLED = int(os.getenv("SCHEDULER_ENABLED", "1"))
         self.GROUP_RECENT_WINDOW = int(os.getenv("GROUP_RECENT_WINDOW", "50"))
         try:

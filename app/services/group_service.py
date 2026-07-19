@@ -9,6 +9,47 @@ import time
 _GROUP_CACHE: dict[tuple[str, bool], dict] = {}
 _CACHE_TTL_SECONDS = getattr(CONFIG, "GROUP_CACHE_TTL_SECONDS", 600)
 
+def _normalize_group_items(data: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for item in data or []:
+        if not isinstance(item, dict):
+            continue
+        g = dict(item)
+        try:
+            gid = int(g.get("id"))
+        except Exception:
+            normalized.append(g)
+            continue
+        if "raw_id" not in g and gid > 0:
+            g["raw_id"] = gid
+            if bool(g.get("is_megagroup")) or bool(g.get("is_channel")):
+                g["id"] = -(1000000000000 + gid)
+            else:
+                g["id"] = -gid
+        normalized.append(g)
+    return normalized
+
+def should_exclude_group_on_error(error_text: str | None) -> bool:
+    if not error_text:
+        return False
+    err = str(error_text).lower()
+    markers = (
+        "banned from sending messages",
+        "user_banned_in_channel",
+        "chat_write_forbidden",
+        "chat_send_plain_forbidden",
+        "chat_send_media_forbidden",
+        "peer error",
+        "invalid peer",
+        "could not find the input entity",
+        "peer_is_user",
+        "the chat is restricted and cannot be used in that request",
+        "chat restricted",
+    )
+    if any(marker in err for marker in markers):
+        return True
+    return False
+
 def get_banned_group_ids(db: Session, account: Optional[str] = None) -> list[int]:
     if not account:
         return []
@@ -44,7 +85,7 @@ async def get_groups(manager: MultiTelegramManager, account: str, only_groups: b
     if not refresh:
         c = _GROUP_CACHE.get(key)
         if c and (time.monotonic() - c.get("ts", 0)) < _CACHE_TTL_SECONDS:
-            data = c.get("data", [])
+            data = _normalize_group_items(c.get("data", []))
             if db is not None:
                 banned = set(get_banned_group_ids(db, account))
                 if banned:
@@ -59,7 +100,7 @@ async def get_groups(manager: MultiTelegramManager, account: str, only_groups: b
             )
             if row:
                 try:
-                    data = json.loads(row.data_json or "[]")
+                    data = _normalize_group_items(json.loads(row.data_json or "[]"))
                     if db is not None:
                         banned = set(get_banned_group_ids(db, account))
                         if banned:
@@ -68,7 +109,7 @@ async def get_groups(manager: MultiTelegramManager, account: str, only_groups: b
                     return data
                 except Exception:
                     pass
-    data = await manager.get_joined_groups(account, only_groups=only_groups)
+    data = _normalize_group_items(await manager.get_joined_groups(account, only_groups=only_groups))
     if db is not None:
         banned = set(get_banned_group_ids(db, account))
         if banned:

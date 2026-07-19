@@ -12,7 +12,7 @@ from app.telegram_client import multi_manager, set_copy_receiver, set_on_private
 from sqlalchemy.orm import Session
 from app.models import SendLog, Task, TaskEvent, SystemKV
 from app.services.send_service import send_to_groups
-from app.services.group_service import get_groups, clear_group_cache
+from app.services.group_service import get_groups, clear_group_cache, add_banned_group, should_exclude_group_on_error
 # from app.services.multi_account_sender import get_multi_sender  # 暂不使用
 from app.routers.accounts import check_single_account, delete_account, bulk_update_profile
 from app.routers.system import reset_system
@@ -486,15 +486,16 @@ async def debug_groups(request: Request):
         info["dialogs_count"] = len(dialogs)
         sample = []
         from telethon.tl.types import Channel, Chat
+        from telethon.utils import get_peer_id
         for d in dialogs[:10]:
             e = d.entity
             if isinstance(e, Chat):
-                sample.append({"id": e.id, "title": d.name, "type": "chat"})
+                sample.append({"id": get_peer_id(e), "raw_id": e.id, "title": d.name, "type": "chat"})
             elif isinstance(e, Channel):
                 is_megagroup = bool(getattr(e, "megagroup", False))
                 if only_groups and not is_megagroup:
                     continue
-                sample.append({"id": e.id, "title": d.name, "type": "channel", "megagroup": is_megagroup})
+                sample.append({"id": get_peer_id(e), "raw_id": e.id, "title": d.name, "type": "channel", "megagroup": is_megagroup})
         info["sample"] = sample
         info["groups_count"] = len(sample)
         return JSONResponse(info)
@@ -618,23 +619,6 @@ async def recent_logs(request: Request):
             for r in rows
         ]
         return JSONResponse(data)
-    finally:
-        db.close()
-
-
-@app.route("/api/logs/clear", methods=["POST"])
-async def clear_logs(request: Request):
-    token = request.headers.get("X-Admin-Token")
-    if token != CONFIG.ADMIN_TOKEN:
-        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    db: Session = SessionLocal()
-    try:
-        db.query(SendLog).delete()
-        db.commit()
-        return JSONResponse({"ok": True, "message": "All logs cleared"})
-    except Exception as e:
-        db.rollback()
-        return JSONResponse({"detail": str(e)}, status_code=500)
     finally:
         db.close()
 
@@ -774,6 +758,21 @@ async def startup_event():
     db: Session = SessionLocal()
     try:
         rows = db.query(Task).filter(Task.status == "running").limit(100).all()
+        if int(getattr(CONFIG, "RESUME_TASKS_ON_STARTUP", 0)) != 1:
+            now = CONFIG.now()
+            for t in rows:
+                t.status = "stopped"
+                t.stop_requested = 1
+                t.finished_at = now
+                db.add(TaskEvent(
+                    task_id=t.id,
+                    event="startup_resume_skipped",
+                    detail="resume_disabled_on_startup",
+                    meta_json=json.dumps({}, ensure_ascii=False),
+                ))
+            db.commit()
+            print(f"[STARTUP] Resume disabled, stopped {len(rows)} running task(s)")
+            return
         for t in rows:
             try:
                 gids = json.loads(t.group_ids_json or "[]")
@@ -865,6 +864,43 @@ def _check_request_guard(token: str, request_id: str | None, window_ms: int = 50
         return False, "too_frequent"
     _LAST_TS[token] = now
     return True, None
+
+
+def _get_existing_tasks_by_request_id(db: Session, request_id: str | None) -> list[Task]:
+    if not request_id:
+        return []
+    return (
+        db.query(Task)
+        .filter(Task.request_id == request_id)
+        .order_by(Task.started_at.desc())
+        .all()
+    )
+
+
+def _mark_task_stopped_if_requested(db: Session, task_id: str, detail: str) -> bool:
+    t = db.query(Task).filter(Task.id == task_id).first()
+    if not t:
+        return True
+    if not t.stop_requested:
+        return False
+    if t.status != "stopped":
+        t.status = "stopped"
+        t.finished_at = CONFIG.now()
+        db.add(TaskEvent(task_id=task_id, event="stopped", detail=detail, meta_json=json.dumps({}, ensure_ascii=False)))
+        db.commit()
+    return True
+
+
+async def _sleep_with_task_checks(task_id: str, seconds: float, step_s: float = 1.0) -> bool:
+    remaining = max(0.0, float(seconds))
+    while remaining > 0:
+        with SessionLocal() as db:
+            if _mark_task_stopped_if_requested(db, task_id, "task_stopped_during_wait"):
+                return False
+        wait_s = min(step_s, remaining)
+        await asyncio.sleep(wait_s)
+        remaining -= wait_s
+    return True
 
 app.add_event_handler("startup", startup_event)
 
@@ -983,7 +1019,7 @@ async def send_async(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = int(body.get("rounds", 100))
+    rounds = max(1, int(body.get("rounds", 1)))
     round_interval_s = int(body.get("round_interval_s", 600))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
@@ -1002,6 +1038,9 @@ async def send_async(request: Request):
     task_id = uuid.uuid4().hex[:24]
     db: Session = SessionLocal()
     try:
+        existing = _get_existing_tasks_by_request_id(db, request_id)
+        if existing:
+            return JSONResponse({"task_id": existing[0].id, "duplicate": True})
         t = Task(
             id=task_id,
             status="running",
@@ -1127,11 +1166,14 @@ async def tasks_summary(request: Request):
         acc_map: dict[str, dict] = {}
         for t in rows:
             k = t.account_name
-            v = acc_map.get(k) or {"account": k, "tasks_count": 0, "total": 0, "success": 0, "failed": 0, "current_round": 0, "rounds": 0, "last_updated_at": None}
+            v = acc_map.get(k) or {"account": k, "tasks_count": 0, "total": 0, "success": 0, "failed": 0, "completed": 0, "current_round": 0, "rounds": 0, "last_updated_at": None}
             v["tasks_count"] += 1
-            v["total"] += int(t.total or 0)
+            round_total = int(t.total or 0)
+            total_rounds = max(1, int(t.rounds or 1))
+            v["total"] += round_total * total_rounds
             v["success"] += int(t.success or 0)
             v["failed"] += int(t.failed or 0)
+            v["completed"] += int((t.success or 0) + (t.failed or 0))
             v["current_round"] = max(int(v["current_round"] or 0), int(t.current_round or 0))
             v["rounds"] = max(int(v["rounds"] or 0), int(t.rounds or 0))
             ts = t.heartbeat_at or t.started_at
@@ -1281,7 +1323,8 @@ async def _run_send_task_with_delay(
     """带延迟启动的发送任务包装器"""
     if start_delay > 0:
         print(f"[TASK] {account}: waiting {start_delay:.1f}s before starting...")
-        await asyncio.sleep(start_delay)
+        if not await _sleep_with_task_checks(task_id, start_delay):
+            return
     print(f"[TASK] {account}: starting send task (task_id={task_id[:8]}...)")
     await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s, start_round_idx, start_group_idx)
 
@@ -1294,12 +1337,9 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
         if not error_text:
             return True
         err = str(error_text).lower()
+        if should_exclude_group_on_error(err):
+            return False
         hard_fail_markers = (
-            "banned from sending messages",
-            "user_banned_in_channel",
-            "chat_write_forbidden",
-            "chat_send_plain_forbidden",
-            "chat_send_media_forbidden",
             "peer error",
             "invalid peer",
             "could not find the input entity",
@@ -1314,6 +1354,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             current_round = i + 1
             
             # --- Round Setup ---
+            resume_current_round = (i == start_round_idx and start_group_idx > 0)
             with SessionLocal() as db:
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if not t:
@@ -1323,9 +1364,10 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     t.current_round = current_round
                     if i != start_round_idx:
                         t.current_index = 0
-                    db.commit()
 
-                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
+                if resume_current_round:
+                    ids = list(group_ids)
+                elif int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
                     grades = classify_groups(db, account, group_ids)
                     role = classify_account(db, account)
                     ids = select_groups_for_account(role, group_ids, grades)
@@ -1333,21 +1375,27 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     ids = list(group_ids)
                     random.shuffle(ids)
                 ids = unique_group_ids(ids)
-                ids = sort_groups_for_account(db, account, ids)
+                if not resume_current_round:
+                    ids = sort_groups_for_account(db, account, ids)
+                t.group_ids_json = json.dumps(ids)
+                db.commit()
             deferred_once: set[int] = set()
             
             # Resumption logic: skip groups if restarting in the middle of a round
+            start_pos = 0
             if i == start_round_idx and start_group_idx > 0:
                 print(f"[TASK] {account}: Resuming round {current_round} from index {start_group_idx}")
                 if start_group_idx < len(ids):
-                    ids = ids[start_group_idx:]
+                    start_pos = start_group_idx
                 else:
                     ids = []
             
-            print(f"[TASK] {account}: Processing round {current_round}, {len(ids)} groups remaining")
+            print(f"[TASK] {account}: Processing round {current_round}, {max(0, len(ids) - start_pos)} groups remaining")
 
             # --- Process Groups ---
-            for idx, gid in enumerate(ids):
+            pos = start_pos
+            while pos < len(ids):
+                gid = ids[pos]
                 # Use a fresh session for each message to avoid long-lived session issues
                 with SessionLocal() as db:
                     t = db.query(Task).filter(Task.id == task_id).first()
@@ -1425,26 +1473,40 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     
                     t = db.query(Task).filter(Task.id == task_id).first()
                     if t:
+                        finalized = False
                         if ok:
                             t.success = (t.success or 0) + 1
                             consecutive_failures = 0
+                            finalized = True
                         else:
-                            t.failed = (t.failed or 0) + 1
                             consecutive_failures += 1
+                            if should_exclude_group_on_error(err):
+                                try:
+                                    add_banned_group(db, account, gid)
+                                except Exception:
+                                    pass
                             if gid not in deferred_once and _should_defer_group(err):
-                                ids.append(gid)
                                 deferred_once.add(gid)
-                                t.total = (t.total or 0) + 1
+                                ids.pop(pos)
+                                ids.append(gid)
+                                t.group_ids_json = json.dumps(ids)
                                 db.add(TaskEvent(
                                     task_id=task_id,
                                     event="deferred",
                                     detail="group_deferred_to_tail",
                                     meta_json=json.dumps({"gid": gid, "error": err}, ensure_ascii=False),
                                 ))
-                        
-                        t.current_index = (t.current_index or 0) + 1
+                            else:
+                                t.failed = (t.failed or 0) + 1
+                                finalized = True
+
+                        if finalized:
+                            t.current_index = (t.current_index or 0) + 1
+                            pos += 1
                         t.heartbeat_at = CONFIG.now()
-                        db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{t.current_index}/{t.total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
+                        completed = int((t.success or 0) + (t.failed or 0))
+                        overall_total = int((t.total or 0) * max(1, int(t.rounds or 1)))
+                        db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{completed}/{overall_total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
                     
                     # Auto-pause logic
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -1459,7 +1521,8 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 
                 # Handle auto-pause outside of DB session
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    await asyncio.sleep(600)
+                    if not await _sleep_with_task_checks(task_id, 600):
+                        return
                     consecutive_failures = 0
                     continue
 
@@ -1471,11 +1534,13 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
                     jitter = random.uniform(-jitter_pct, jitter_pct) * base_ms
                     wait_ms = max(0, base_ms + jitter)
-                    await asyncio.sleep(wait_ms / 1000.0)
+                    if not await _sleep_with_task_checks(task_id, wait_ms / 1000.0):
+                        return
                 else:
                     d = max(delay_ms, 0) / 1000.0
                     if d > 0:
-                        await asyncio.sleep(d)
+                        if not await _sleep_with_task_checks(task_id, d):
+                            return
 
             # --- End of Round ---
             if current_round < rounds:
@@ -1516,7 +1581,8 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             db.commit()
                 
                 if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
+                    if not await _sleep_with_task_checks(task_id, sleep_time):
+                        return
 
         # --- Task Done ---
         with SessionLocal() as db:
@@ -1753,7 +1819,7 @@ async def send_multi_account(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = int(body.get("rounds", 1))
+    rounds = max(1, int(body.get("rounds", 1)))
     round_interval_s = int(body.get("round_interval_s", 600))
     # 错开延迟：默认 10-30 秒，防风控但不会等太久
     stagger_min_s = float(body.get("stagger_min_s", 10))
@@ -1798,6 +1864,29 @@ async def send_multi_account(request: Request):
     task_ids = []
     db: Session = SessionLocal()
     try:
+        existing = _get_existing_tasks_by_request_id(db, request_id)
+        if existing:
+            existing_tasks = []
+            for t in existing:
+                try:
+                    existing_group_ids = json.loads(t.group_ids_json or "[]")
+                except Exception:
+                    existing_group_ids = []
+                existing_tasks.append({
+                    "account": t.account_name,
+                    "task_id": t.id,
+                    "group_ids": existing_group_ids,
+                })
+            return JSONResponse({
+                "tasks": existing_tasks,
+                "accounts_count": len(existing_tasks),
+                "planned_groups": sum(len(it["group_ids"]) for it in existing_tasks),
+                "unique_groups": len(group_ids),
+                "strategy": "unique_group_rotation",
+                "duplicate": True,
+                "stagger_min_s": stagger_min_s,
+                "stagger_max_s": stagger_max_s,
+            })
         for acc in accounts:
             acc_group_ids = planned_distribution.get(acc, [])
             if not acc_group_ids:
@@ -1844,7 +1933,12 @@ async def send_multi_account(request: Request):
             items = []
             for it in task_ids:
                 role = classify_account(db2, it["account"])
-                items.append({"account": it["account"], "task_id": it["task_id"], "role": role})
+                items.append({
+                    "account": it["account"],
+                    "task_id": it["task_id"],
+                    "role": role,
+                    "group_ids": it["group_ids"],
+                })
             role_order = {"SAFE": 0, "CORE": 1, "RISK": 2}
             items.sort(key=lambda x: role_order.get(x["role"], 1))
             cumulative_delay = 0.0

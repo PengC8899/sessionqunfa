@@ -101,7 +101,7 @@ function renderGlobalSummary() {
     const total = Math.max(0, parseInt(r.total || 0));
     const succ = Math.max(0, parseInt(r.success || 0));
     const fail = Math.max(0, parseInt(r.failed || 0));
-    const processed = Math.max(0, parseInt((r.processed != null ? r.processed : (succ + fail)) || 0));
+    const processed = Math.max(0, parseInt((r.completed != null ? r.completed : (r.processed != null ? r.processed : (succ + fail))) || 0));
     const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -318,7 +318,7 @@ async function send(path) {
   const msg = document.getElementById('message').value;
   const parseMode = document.getElementById('parseMode').value;
   const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
-  const rounds = parseInt(document.getElementById('rounds')?.value || '100');
+  const rounds = parseInt(document.getElementById('rounds')?.value || '1');
   const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
@@ -1371,7 +1371,7 @@ async function startBatchSend() {
   // 获取发送参数
   const parseMode = document.getElementById('parseMode')?.value || 'plain';
   const delayMs = parseInt(document.getElementById('delayMs')?.value) || 11000;
-  const rounds = parseInt(document.getElementById('rounds')?.value) || 100;
+  const rounds = parseInt(document.getElementById('rounds')?.value) || 1;
   const roundIntervalS = parseInt(document.getElementById('roundInterval')?.value) || 600;
   const disablePreview = document.getElementById('disablePreview')?.checked ?? true;
   
@@ -1407,12 +1407,12 @@ async function startBatchSend() {
     
     if (res.ok) {
       const taskCount = data.tasks?.length || data.accounts_count || 0;
-      resultEl.textContent = `✅ 已创建 ${taskCount} 个任务`;
+      resultEl.textContent = data.duplicate ? `✅ 复用已有 ${taskCount} 个任务` : `✅ 已创建 ${taskCount} 个任务`;
       resultEl.style.color = 'var(--success-color)';
       
       // 刷新任务列表
-      if (typeof fetchSummary === 'function') {
-        fetchSummary();
+      if (typeof fetchGlobalSummary === 'function') {
+        fetchGlobalSummary(true);
       }
     } else {
       resultEl.textContent = `❌ ${data.detail || '创建失败'}`;

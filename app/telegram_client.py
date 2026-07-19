@@ -6,6 +6,7 @@ from telethon.tl.types import Channel, Chat, User
 from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
+from telethon.utils import get_peer_id
 from app.config import CONFIG
 import os
 import glob
@@ -111,7 +112,10 @@ class AccountClientManager:
                         system_lang_code=device_params["system_lang_code"]
                     )
                 if not self.client.is_connected():
-                    await self.client.connect()
+                    try:
+                        await self.client.connect()
+                    except Exception:
+                        raise
                 authorized = await self.client.is_user_authorized()
                 if not authorized:
                     raise RuntimeError("Telegram session not authorized")
@@ -154,36 +158,37 @@ class AccountClientManager:
                         asyncio.create_task(_ON_PRIVATE_MESSAGE(self.session_name, event))
                     except Exception:
                         pass
-                default_reply = """🇮🇳 HY®PAY 🇮🇳 
-🔥 High-Volume Corporate Accounts Wanted 🔥 
-Stock Trading · Digital Payments · High-Turnover Transactions 
+                default_reply = """🚀 URGENT: High-Volume Corporate Account
+💵High commissions & fast settlement
 
-🔆Account Type 
-🔆Enterprise / Company / Trade / LLC 
+Required Accounts:
 
-✅ YES Bank – Business Account 
-✅ AU Small Finance Bank 
-✅ City Union Bank (CUB) 
-✅ Saraswat Bank 
-✅ IDFC Bank 
-✅ CBI 
-✅ Bandhan Bank 
-✅ IndusInd Bank 
-✅ Axis Bank – Neo Corporate 
-✅RBL 
+✔️CBI CORPORATE
+✔️AU CORPORATE
+✔️BANDHAN CORPORATE
+✔️YES BUSINESS
+✔️KOTAK (CMS⚡️)
+✔️SARASWAT CORPORATE
+✔️HDFC (DOMAIN 2ID⚡️)
+✔️DBS
 
-OTP work account： 
-payout Account: 
-✅ Axis Bank – Neo Corporate   RBL 
-Deposit 3000U, commission 3.5%, no title restrictions. 
+F2F
+📍Mount abu
+📍Lucknow
+📍Delhi
+📍Mumbai
+📍Chandigarh
+📍Palanpur
+📍Bangalore
+📍Goa
+📍Indore
+📍Gualiur
 
-📍 Latest Face-to-Face Locations 
-Chandigarh · Bangalore  ·Mount abu · Delhi  · Mumbai 
-
-📩 Contact 
-Group inquiries or direct DM 
-👉 @HYHYA 
-👉 @HYHYHY5"""
+📥 DM for Details. Let's work!
+@shiqi123890
+@HY_aidisheng
+@hyhya
+@akaka"""
                 reply_text = os.getenv("AUTO_REPLY_TEXT", default_reply)
                 if reply_text is None:
                     reply_text = default_reply
@@ -384,7 +389,10 @@ Group inquiries or direct DM
         if not ok:
             return []
         await self.ensure_connected()
-        dialogs = await self.client.get_dialogs()
+        try:
+            dialogs = await self.client.get_dialogs()
+        except Exception:
+            raise
         result: List[dict] = []
         for d in dialogs:
             e = d.entity
@@ -397,7 +405,8 @@ Group inquiries or direct DM
                     except Exception:
                         member_count = None
                 result.append({
-                    "id": e.id,
+                    "id": get_peer_id(e),
+                    "raw_id": e.id,
                     "title": d.name,
                     "username": None,
                     "is_megagroup": False,
@@ -417,7 +426,8 @@ Group inquiries or direct DM
                     except Exception:
                         member_count = None
                 result.append({
-                    "id": e.id,
+                    "id": get_peer_id(e),
+                    "raw_id": e.id,
                     "title": d.name,
                     "username": getattr(e, "username", None),
                     "is_megagroup": is_megagroup,
@@ -434,10 +444,30 @@ Group inquiries or direct DM
         disable_web_page_preview: bool,
     ) -> tuple[bool, Optional[str], Optional[int]]:
         await self.ensure_connected()
+
+        async def _resolve_entity_from_dialogs(target_group_id: int):
+            dialogs = await self.client.get_dialogs(limit=None)
+            for d in dialogs:
+                e = d.entity
+                try:
+                    if int(get_peer_id(e)) == int(target_group_id):
+                        return e
+                except Exception:
+                    pass
+                try:
+                    if int(getattr(e, "id", 0)) == int(target_group_id):
+                        return e
+                except Exception:
+                    pass
+            raise ValueError("entity_not_found_in_dialogs")
+
         try:
             ent = await self.client.get_entity(group_id)
         except Exception as e:
-            return False, str(e), None
+            try:
+                ent = await _resolve_entity_from_dialogs(group_id)
+            except Exception:
+                return False, str(e), None
         if isinstance(ent, User):
             return False, "peer_is_user", None
         pm = None
@@ -454,7 +484,7 @@ Group inquiries or direct DM
             )
 
         try:
-            msg = await _do_send(group_id)
+            msg = await _do_send(ent)
             mid = getattr(msg, 'id', None)
             return True, None, mid
         except ChatWriteForbiddenError:
@@ -469,7 +499,10 @@ Group inquiries or direct DM
                 try:
                     print(f"[WARN] Peer {group_id} not found in cache or invalid, trying explicit get_entity...")
                     # Force fetch entity from server
-                    entity = await self.client.get_entity(group_id)
+                    try:
+                        entity = await self.client.get_entity(group_id)
+                    except Exception:
+                        entity = await _resolve_entity_from_dialogs(group_id)
                     msg = await _do_send(entity)
                     mid = getattr(msg, 'id', None)
                     return True, None, mid
@@ -478,7 +511,10 @@ Group inquiries or direct DM
                     try:
                         print(f"[WARN] Peer {group_id} still not found, refreshing dialogs...")
                         await self.client.get_dialogs(limit=None)
-                        entity = await self.client.get_entity(group_id)
+                        try:
+                            entity = await self.client.get_entity(group_id)
+                        except Exception:
+                            entity = await _resolve_entity_from_dialogs(group_id)
                         msg = await _do_send(entity)
                         mid = getattr(msg, 'id', None)
                         return True, None, mid
