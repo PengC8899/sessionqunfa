@@ -98,6 +98,7 @@ async def send_to_groups(
                         error=None if status == "success" else (err or ("" if status == "skipped" else "send_failed")),
                         message_id=msg_id,
                         parse_mode=parse_mode,
+                        created_at=CONFIG.now(),
                     )
                 )
                 db.commit()
@@ -165,6 +166,7 @@ async def send_to_groups(
                 error=None if status == "success" else (err or ("" if status == "skipped" else "send_failed")),
                 message_id=msg_id,
                 parse_mode=parse_mode,
+                created_at=CONFIG.now(),
             )
         )
         db.commit()

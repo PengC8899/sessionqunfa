@@ -12,9 +12,22 @@ from app.telegram_client import multi_manager, set_copy_receiver, set_on_private
 from sqlalchemy.orm import Session
 from app.models import SendLog, Task, TaskEvent, SystemKV
 from app.services.send_service import send_to_groups
-from app.services.group_service import get_groups, clear_group_cache, add_banned_group, should_exclude_group_on_error
+from app.services.group_service import (
+    get_groups,
+    clear_group_cache,
+    add_banned_group,
+    should_exclude_group_on_error,
+    should_add_to_blist,
+)
 # from app.services.multi_account_sender import get_multi_sender  # 暂不使用
-from app.routers.accounts import check_single_account, delete_account, bulk_update_profile
+from app.routers.accounts import (
+    check_single_account,
+    delete_account,
+    bulk_update_profile,
+    get_account_profile,
+    get_authorized_profiles,
+    update_account_profile,
+)
 from app.routers.system import reset_system
 from app.services.account_service import account_service
 from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate, unique_group_ids, sort_groups_for_account, distribute_groups_unique
@@ -154,6 +167,9 @@ async def list_authorized_accounts(request: Request):
 app.add_route("/api/accounts/check-single", check_single_account, methods=["POST"])
 app.add_route("/api/accounts/delete", delete_account, methods=["POST"])
 app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=["POST"])
+app.add_route("/api/accounts/profile", get_account_profile, methods=["GET"])
+app.add_route("/api/accounts/profiles-authorized", get_authorized_profiles, methods=["GET"])
+app.add_route("/api/accounts/profile", update_account_profile, methods=["POST"])
 app.add_route("/api/system/reset", reset_system, methods=["POST"])
 
 
@@ -614,7 +630,7 @@ async def recent_logs(request: Request):
                 "error": r.error,
                 "message_id": getattr(r, "message_id", None),
                 "parse_mode": getattr(r, "parse_mode", None),
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "created_at": _serialize_log_created_at(r.created_at),
             }
             for r in rows
         ]
@@ -652,7 +668,7 @@ async def export_logs_csv(request: Request):
                 (r.error or "").replace("\n"," ").strip(),
                 getattr(r, "message_id", None),
                 getattr(r, "parse_mode", None),
-                r.created_at.isoformat() if r.created_at else "",
+                _serialize_log_created_at(r.created_at) or "",
             ])
         csv_data = buf.getvalue()
         headers = {"Content-Type": "text/csv; charset=utf-8", "Content-Disposition": "attachment; filename=send_logs.csv"}
@@ -826,6 +842,8 @@ async def _periodic_task_cleanup():
                 timeout_s = int(getattr(CONFIG, "TASK_STUCK_TIMEOUT_S", 900))
                 rows = db.query(Task).filter(Task.status == "running").limit(200).all()
                 for t in rows:
+                    if int(t.paused or 0) == 1:
+                        continue
                     hb = t.heartbeat_at or t.started_at
                     if hb:
                         if hb.tzinfo is None:
@@ -877,12 +895,42 @@ def _get_existing_tasks_by_request_id(db: Session, request_id: str | None) -> li
     )
 
 
+def _planned_group_count(group_ids_json: str | None) -> int:
+    try:
+        group_ids = json.loads(group_ids_json or "[]")
+    except Exception:
+        return 0
+    return len(group_ids) if isinstance(group_ids, list) else 0
+
+
+def _serialize_log_created_at(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        target_tz = CONFIG.get_timezone()
+    except Exception:
+        target_tz = timezone.utc
+    dt = value
+    if dt.tzinfo is None:
+        # SQLite often returns naive datetimes even when the original value was
+        # written in the configured local timezone. Treat naive log timestamps
+        # as local configured time to avoid shifting them by the timezone offset.
+        dt = dt.replace(tzinfo=target_tz)
+    try:
+        dt = dt.astimezone(target_tz)
+    except Exception:
+        pass
+    return dt.isoformat()
+
+
 def _mark_task_stopped_if_requested(db: Session, task_id: str, detail: str) -> bool:
     t = db.query(Task).filter(Task.id == task_id).first()
     if not t:
         return True
     if not t.stop_requested:
         return False
+    if t.status == "error":
+        return True
     if t.status != "stopped":
         t.status = "stopped"
         t.finished_at = CONFIG.now()
@@ -891,12 +939,27 @@ def _mark_task_stopped_if_requested(db: Session, task_id: str, detail: str) -> b
     return True
 
 
-async def _sleep_with_task_checks(task_id: str, seconds: float, step_s: float = 1.0) -> bool:
+async def _sleep_with_task_checks(
+    task_id: str,
+    seconds: float,
+    step_s: float = 1.0,
+    refresh_heartbeat: bool = True,
+    heartbeat_interval_s: float = 30.0,
+) -> bool:
     remaining = max(0.0, float(seconds))
+    next_heartbeat_at = time.monotonic()
     while remaining > 0:
         with SessionLocal() as db:
             if _mark_task_stopped_if_requested(db, task_id, "task_stopped_during_wait"):
                 return False
+            if refresh_heartbeat and time.monotonic() >= next_heartbeat_at:
+                t = db.query(Task).filter(Task.id == task_id).first()
+                if not t:
+                    return False
+                if t.status == "running":
+                    t.heartbeat_at = CONFIG.now()
+                    db.commit()
+                next_heartbeat_at = time.monotonic() + max(1.0, float(heartbeat_interval_s))
         wait_s = min(step_s, remaining)
         await asyncio.sleep(wait_s)
         remaining -= wait_s
@@ -1019,7 +1082,7 @@ async def send_async(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = max(1, int(body.get("rounds", 1)))
+    rounds = max(1, int(body.get("rounds", 100)))
     round_interval_s = int(body.get("round_interval_s", 600))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
@@ -1057,6 +1120,7 @@ async def send_async(request: Request):
             current_index=0,
             group_ids_json=json.dumps(group_ids),
             request_id=request_id,
+            heartbeat_at=CONFIG.now(),
         )
         db.add(t)
         db.add(TaskEvent(task_id=task_id, event="created", detail="task_created", meta_json=json.dumps({"count": len(group_ids)}, ensure_ascii=False)))
@@ -1137,6 +1201,19 @@ async def task_status(request: Request):
         t = db.query(Task).filter(Task.id == task_id).first()
         if not t:
             return JSONResponse({"detail": "Not Found"}, status_code=404)
+        # 计算当前轮次的进度
+        current_round_planned = _planned_group_count(t.group_ids_json)
+        current_round_sent = min(max(0, int(t.current_index or 0)), current_round_planned)
+        current_round_completed = min(max(0, int(t.current_index or 0)), current_round_planned)
+        
+        # 计算累计进度（前面轮次 + 当前轮次）
+        total_sent_all_rounds = int((t.success or 0) + (t.failed or 0))
+        previous_rounds_sent = max(0, total_sent_all_rounds - current_round_sent)
+        
+        # 总体进度：前面轮次已完成 + 当前轮次计划数
+        overall_planned = previous_rounds_sent + current_round_planned
+        overall_completed = total_sent_all_rounds
+        
         data = {
             "task_id": t.id,
             "status": t.status,
@@ -1144,8 +1221,14 @@ async def task_status(request: Request):
             "success": t.success,
             "failed": t.failed,
             "current_index": t.current_index,
+            "current_round_planned": current_round_planned,
+            "current_round_sent": current_round_sent,
+            "current_round_completed": current_round_completed,
+            "previous_rounds_completed": previous_rounds_sent,
+            "overall_planned": overall_planned,
+            "overall_completed": overall_completed,
             "started_at": t.started_at.isoformat() if t.started_at else None,
-            "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+            "finished_at": t.finished_at.isoformat() if t.started_at else None,
             "rounds": t.rounds,
             "current_round": t.current_round,
             "round_interval_s": t.round_interval_s,
@@ -1162,31 +1245,72 @@ async def tasks_summary(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     db: Session = SessionLocal()
     try:
-        rows = db.query(Task).filter(Task.status.in_(["running", "error"])).all()
+        rows = (
+            db.query(Task)
+            .order_by(Task.started_at.desc())
+            .limit(300)
+            .all()
+        )
         acc_map: dict[str, dict] = {}
         for t in rows:
             k = t.account_name
-            v = acc_map.get(k) or {"account": k, "tasks_count": 0, "total": 0, "success": 0, "failed": 0, "completed": 0, "current_round": 0, "rounds": 0, "last_updated_at": None}
-            v["tasks_count"] += 1
-            round_total = int(t.total or 0)
-            total_rounds = max(1, int(t.rounds or 1))
-            v["total"] += round_total * total_rounds
-            v["success"] += int(t.success or 0)
-            v["failed"] += int(t.failed or 0)
-            v["completed"] += int((t.success or 0) + (t.failed or 0))
-            v["current_round"] = max(int(v["current_round"] or 0), int(t.current_round or 0))
-            v["rounds"] = max(int(v["rounds"] or 0), int(t.rounds or 0))
-            ts = t.heartbeat_at or t.started_at
-            if ts:
-                cur = v["last_updated_at"]
-                if (not cur) or (ts > cur):
-                    v["last_updated_at"] = ts
-            acc_map[k] = v
+            existing = acc_map.get(k)
+            current_ts = t.heartbeat_at or t.finished_at or t.started_at
+            existing_ts = None
+            if existing:
+                existing_ts = existing.get("_sort_ts")
+
+            # Running tasks always win. Otherwise keep the most recent task
+            # so the monitor panel can still show failed/stopped/done tasks.
+            should_replace = False
+            if not existing:
+                should_replace = True
+            elif existing.get("status") != "running" and t.status == "running":
+                should_replace = True
+            elif existing.get("status") != "running" and t.status != "running":
+                if current_ts and ((not existing_ts) or current_ts > existing_ts):
+                    should_replace = True
+
+            if not should_replace:
+                continue
+
+            round_total = _planned_group_count(t.group_ids_json)
+            round_completed = max(0, int(t.current_index or 0))
+            if round_total > 0:
+                round_completed = min(round_completed, round_total)
+
+            total_sent_all_rounds = int((t.success or 0) + (t.failed or 0))
+            previous_rounds_sent = max(0, total_sent_all_rounds - round_completed)
+            overall_planned = previous_rounds_sent + round_total
+            overall_completed = total_sent_all_rounds
+
+            acc_map[k] = {
+                "account": k,
+                "status": t.status,
+                "task_id": t.id,
+                "tasks_count": 1,
+                "total": round_total,
+                "success": int(t.success or 0),
+                "failed": int(t.failed or 0),
+                "completed": round_completed,
+                "progress_total": round_total,
+                "progress_completed": round_completed,
+                "current_round": int(t.current_round or 0),
+                "rounds": int(t.rounds or 0),
+                "current_round_planned": round_total,
+                "current_round_sent": round_completed,
+                "overall_planned": overall_planned,
+                "overall_completed": overall_completed,
+                "last_updated_at": current_ts,
+                "_sort_ts": current_ts,
+            }
         data = []
         for _, e in acc_map.items():
             if e.get("last_updated_at"):
                 e["last_updated_at"] = e["last_updated_at"].isoformat()
+            e.pop("_sort_ts", None)
             data.append(e)
+        data.sort(key=lambda x: x.get("last_updated_at") or "", reverse=True)
         return JSONResponse(data)
     finally:
         db.close()
@@ -1323,7 +1447,7 @@ async def _run_send_task_with_delay(
     """带延迟启动的发送任务包装器"""
     if start_delay > 0:
         print(f"[TASK] {account}: waiting {start_delay:.1f}s before starting...")
-        if not await _sleep_with_task_checks(task_id, start_delay):
+        if not await _sleep_with_task_checks(task_id, start_delay, refresh_heartbeat=True):
             return
     print(f"[TASK] {account}: starting send task (task_id={task_id[:8]}...)")
     await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s, start_round_idx, start_group_idx)
@@ -1337,7 +1461,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
         if not error_text:
             return True
         err = str(error_text).lower()
-        if should_exclude_group_on_error(err):
+        if should_add_to_blist(err):
             return False
         hard_fail_markers = (
             "peer error",
@@ -1362,7 +1486,12 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     return
                 else:
                     t.current_round = current_round
-                    if i != start_round_idx:
+                    # 每轮开始时重置索引（无论是新轮次还是从恢复点继续）
+                    if i == start_round_idx and start_group_idx > 0:
+                        # 恢复任务，从断点继续
+                        pass  # 保留 current_index 用于恢复逻辑
+                    else:
+                        # 新轮次开始，重置索引
                         t.current_index = 0
 
                 if resume_current_round:
@@ -1468,6 +1597,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         error=None if ok else (err or "send_failed"),
                         message_id=msg_id,
                         parse_mode=parse_mode,
+                        created_at=CONFIG.now(),
                     )
                     db.add(log)
                     
@@ -1480,7 +1610,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             finalized = True
                         else:
                             consecutive_failures += 1
-                            if should_exclude_group_on_error(err):
+                            if should_add_to_blist(err):
                                 try:
                                     add_banned_group(db, account, gid)
                                 except Exception:
@@ -1504,9 +1634,16 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             t.current_index = (t.current_index or 0) + 1
                             pos += 1
                         t.heartbeat_at = CONFIG.now()
-                        completed = int((t.success or 0) + (t.failed or 0))
-                        overall_total = int((t.total or 0) * max(1, int(t.rounds or 1)))
-                        db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{completed}/{overall_total}", meta_json=json.dumps({"gid": gid}, ensure_ascii=False)))
+                        # 获取当前轮次的实际计划数
+                        current_round_planned = _planned_group_count(t.group_ids_json)
+                        # 计算当前轮次已完成数
+                        current_round_completed = min(int(t.current_index or 0), current_round_planned)
+                        # 计算前面轮次的累计完成数
+                        previous_rounds_completed = max(0, int((t.success or 0) + (t.failed or 0)) - current_round_completed)
+                        # 总体进度：前面轮次累计 + 当前轮次实际计划数
+                        overall_total = previous_rounds_completed + current_round_planned
+                        overall_completed = previous_rounds_completed + current_round_completed
+                        db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{overall_completed}/{overall_total}", meta_json=json.dumps({"gid": gid, "round": t.current_round, "round_completed": current_round_completed, "round_planned": current_round_planned}, ensure_ascii=False)))
                     
                     # Auto-pause logic
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -1521,7 +1658,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 
                 # Handle auto-pause outside of DB session
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    if not await _sleep_with_task_checks(task_id, 600):
+                    if not await _sleep_with_task_checks(task_id, 600, refresh_heartbeat=True):
                         return
                     consecutive_failures = 0
                     continue
@@ -1534,12 +1671,12 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
                     jitter = random.uniform(-jitter_pct, jitter_pct) * base_ms
                     wait_ms = max(0, base_ms + jitter)
-                    if not await _sleep_with_task_checks(task_id, wait_ms / 1000.0):
+                    if not await _sleep_with_task_checks(task_id, wait_ms / 1000.0, refresh_heartbeat=True):
                         return
                 else:
                     d = max(delay_ms, 0) / 1000.0
                     if d > 0:
-                        if not await _sleep_with_task_checks(task_id, d):
+                        if not await _sleep_with_task_checks(task_id, d, refresh_heartbeat=True):
                             return
 
             # --- End of Round ---
@@ -1581,7 +1718,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             db.commit()
                 
                 if sleep_time > 0:
-                    if not await _sleep_with_task_checks(task_id, sleep_time):
+                    if not await _sleep_with_task_checks(task_id, sleep_time, refresh_heartbeat=True):
                         return
 
         # --- Task Done ---
@@ -1802,7 +1939,7 @@ async def send_multi_account(request: Request):
         "parse_mode": "plain|markdown|html",
         "disable_web_page_preview": true,
         "delay_ms": 11000,  // 默认 11 秒
-        "rounds": 1,
+        "rounds": 100,
         "round_interval_s": 600,
         "stagger_min_s": 120,  // 账号启动间隔最小秒数
         "stagger_max_s": 300   // 账号启动间隔最大秒数
@@ -1819,7 +1956,7 @@ async def send_multi_account(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
-    rounds = max(1, int(body.get("rounds", 1)))
+    rounds = max(1, int(body.get("rounds", 100)))
     round_interval_s = int(body.get("round_interval_s", 600))
     # 错开延迟：默认 10-30 秒，防风控但不会等太久
     stagger_min_s = float(body.get("stagger_min_s", 10))
@@ -1852,15 +1989,42 @@ async def send_multi_account(request: Request):
     
     if not accounts:
         return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
-    
-    # 先按“群唯一分配 + 全局冷却 + 尽量避免同号重复打同群”生成计划
-    db: Session = SessionLocal()
-    try:
-        planned_distribution = distribute_groups_unique(db, accounts, group_ids)
-    finally:
-        db.close()
 
-    # 为每个账号创建单独任务，但每个账号只拿到自己那一份群
+    unique_accounts = []
+    seen_accounts = set()
+    for acc in accounts:
+        name = str(acc or "").strip()
+        if not name or name in seen_accounts:
+            continue
+        seen_accounts.add(name)
+        unique_accounts.append(name)
+
+    authorized_accounts = []
+    skipped_unauthorized_accounts = []
+    for acc in unique_accounts:
+        try:
+            authorized = await multi_manager.is_authorized(acc)
+        except Exception:
+            authorized = False
+        if authorized:
+            authorized_accounts.append(acc)
+        else:
+            skipped_unauthorized_accounts.append(acc)
+
+    if not authorized_accounts:
+        return JSONResponse({
+            "detail": "no_authorized_accounts",
+            "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
+        }, status_code=403)
+    accounts = authorized_accounts
+    
+    # 批量群发默认应让每个账号都发送完整的所选群组列表。
+    # 之前这里按账号对群组做了唯一分摊，导致用户选了 100+ 个群后，
+    # 每个账号只拿到十几个群，表现成“跑了两轮却只有 20 多条成功记录”。
+    full_group_ids = unique_group_ids(group_ids)
+    planned_distribution = {acc: list(full_group_ids) for acc in accounts}
+
+    # 为每个账号创建单独任务，每个账号都拿到完整群组列表
     task_ids = []
     db: Session = SessionLocal()
     try:
@@ -1881,11 +2045,12 @@ async def send_multi_account(request: Request):
                 "tasks": existing_tasks,
                 "accounts_count": len(existing_tasks),
                 "planned_groups": sum(len(it["group_ids"]) for it in existing_tasks),
-                "unique_groups": len(group_ids),
-                "strategy": "unique_group_rotation",
+                "unique_groups": len(full_group_ids),
+                "strategy": "full_broadcast_per_account",
                 "duplicate": True,
                 "stagger_min_s": stagger_min_s,
                 "stagger_max_s": stagger_max_s,
+                "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
             })
         for acc in accounts:
             acc_group_ids = planned_distribution.get(acc, [])
@@ -1908,6 +2073,7 @@ async def send_multi_account(request: Request):
                 current_index=0,
                 group_ids_json=json.dumps(acc_group_ids),
                 request_id=request_id,
+                heartbeat_at=CONFIG.now(),
             )
             db.add(t)
             db.add(TaskEvent(
@@ -1988,10 +2154,11 @@ async def send_multi_account(request: Request):
         "tasks": task_ids,
         "accounts_count": len(accounts),
         "planned_groups": sum(len(it["group_ids"]) for it in task_ids),
-        "unique_groups": len(group_ids),
-        "strategy": "unique_group_rotation",
+        "unique_groups": len(full_group_ids),
+        "strategy": "full_broadcast_per_account",
         "stagger_min_s": stagger_min_s,
         "stagger_max_s": stagger_max_s,
+        "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
     })
 
 

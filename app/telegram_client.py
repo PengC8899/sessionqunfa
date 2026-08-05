@@ -6,6 +6,7 @@ from telethon.tl.types import Channel, Chat, User
 from telethon.errors import ChatWriteForbiddenError, UserBannedInChannelError
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
+from telethon.tl.functions.users import GetFullUserRequest
 from telethon.utils import get_peer_id
 from app.config import CONFIG
 import os
@@ -564,6 +565,50 @@ F2F
             
         return results
 
+    async def get_profile(self) -> dict:
+        """
+        获取当前账号的昵称、简介等资料
+        """
+        await self.ensure_connected()
+
+        me = await self.client.get_me()
+        about = None
+        try:
+            full = await self.client(GetFullUserRequest("me"))
+            about = getattr(getattr(full, "full_user", None), "about", None)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch full profile for {self.session_name}: {e}")
+
+        return {
+            "account": self.session_name,
+            "id": getattr(me, "id", None),
+            "first_name": getattr(me, "first_name", "") or "",
+            "last_name": getattr(me, "last_name", "") or "",
+            "nickname": getattr(me, "first_name", "") or "",
+            "username": getattr(me, "username", None),
+            "phone": getattr(me, "phone", None),
+            "about": about or "",
+        }
+
+    async def update_text_profile(self, nickname: str, about: str | None = None):
+        """
+        更新当前账号的昵称与简介，不处理头像。
+        昵称写入 first_name，同时保留现有 last_name，避免影响原有资料。
+        """
+        await self.ensure_connected()
+        from telethon.tl.functions.account import UpdateProfileRequest
+
+        me = await self.client.get_me()
+        req_kwargs = {
+            "first_name": nickname,
+            "last_name": getattr(me, "last_name", "") or "",
+        }
+        if about is not None:
+            req_kwargs["about"] = about
+
+        await self.client(UpdateProfileRequest(**req_kwargs))
+        return await self.get_profile()
+
     async def join_group(self, invite_link: str) -> dict:
         """
         通过邀请链接加入群组
@@ -814,6 +859,12 @@ class MultiTelegramManager:
 
     async def update_profile(self, account: str, first_name: str, last_name: str = "", photo_path: str = None):
         return await self.get(account).update_profile(first_name, last_name, photo_path)
+
+    async def get_profile(self, account: str) -> dict:
+        return await self.get(account).get_profile()
+
+    async def update_text_profile(self, account: str, nickname: str, about: str | None = None):
+        return await self.get(account).update_text_profile(nickname, about)
 
 
 multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)

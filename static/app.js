@@ -12,6 +12,7 @@ const state = {
   summarySortKey: 'account',
   summarySortAsc: true,
   authorizedAccounts: [],
+  authorizedProfiles: [],
   receiverMode: false,
 };
 
@@ -35,7 +36,7 @@ function saveToken() {
   // Remove "pc-20251206-7575" legacy token check if needed, but for now just save what user typed
   if (el) { el.textContent = '令牌已保存'; el.className = 'workspace-status text-sm status-success'; }
   localStorage.setItem('tokenLocked', '1');
-  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); });
+  updateTokenLockUI(); fetchAccounts().then(() => { fetchAuthStatus(); fetchGroups(); fetchAuthorizedProfiles(true); });
 }
 
 function groupsCacheKey() {
@@ -98,29 +99,110 @@ function renderGlobalSummary() {
   tbody.innerHTML = '';
   const rows = state.summaryFiltered.length ? state.summaryFiltered : state.summary;
   rows.forEach(r => {
-    const total = Math.max(0, parseInt(r.total || 0));
-    const succ = Math.max(0, parseInt(r.success || 0));
-    const fail = Math.max(0, parseInt(r.failed || 0));
-    const processed = Math.max(0, parseInt((r.completed != null ? r.completed : (r.processed != null ? r.processed : (succ + fail))) || 0));
-    const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+    // 使用后端返回的精确进度字段
+    const total = r.overall_planned || r.progress_total || r.total || 0;
+    const completed = r.overall_completed || r.progress_completed || (r.success || 0) + (r.failed || 0);
+    const pct = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+    
+    // 当前轮次进度
+    const roundPlanned = r.current_round_planned || 0;
+    const roundSent = r.current_round_sent || 0;
+    const roundPct = roundPlanned > 0 ? Math.min(100, Math.round((roundSent / roundPlanned) * 100)) : 0;
+
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><div style="font-weight:600; color:var(--primary-color);">${r.account}</div></td>
       <td>
-        <div class="progress-container">
+        <div style="font-weight:700; color:var(--text-primary);">${r.account}</div>
+        <div style="font-size:10px; color:var(--text-muted); margin-top:2px;">状态: ${r.status || 'running'}</div>
+      </td>
+      <td>
+        <div class="progress-container" style="height:6px; margin-bottom:4px;">
           <div class="progress-bar" style="width:${pct}%"></div>
         </div>
-        <div style="font-size:10px; color:var(--text-secondary); margin-top:2px; display:flex; justify-content:space-between;">
-          <span>${processed}/${total}</span>
-          <span>${pct}%</span>
+        <div style="font-size:11px; color:var(--text-secondary); display:flex; justify-content:space-between; align-items:center;">
+          <span>总进度: ${completed}/${total}</span>
+          <span style="font-weight:700; color:var(--primary-color);">${pct}%</span>
         </div>
+        ${roundPlanned > 0 ? `
+        <div style="margin-top:6px; padding-top:4px; border-top:1px solid rgba(255,255,255,0.05);">
+          <div style="font-size:10px; color:var(--text-muted); display:flex; justify-content:space-between; margin-bottom:2px;">
+            <span>本轮进度</span>
+            <span>${roundSent}/${roundPlanned} (${roundPct}%)</span>
+          </div>
+          <div class="progress-container" style="height:3px; background:rgba(255,255,255,0.03);">
+            <div class="progress-bar" style="width:${roundPct}%; background:var(--success-color); opacity:0.7;"></div>
+          </div>
+        </div>
+        ` : ''}
       </td>
-      <td class="status-success" style="font-weight:600;">${succ}</td>
-      <td class="status-error" style="font-weight:600;">${fail}</td>
-      <td style="font-size:11px; color:var(--text-secondary);">${(r.current_round||0)}/${(r.rounds||0)}</td>
+      <td class="status-success" style="font-weight:700; font-size:1.1rem;">${r.success || 0}</td>
+      <td class="status-error" style="font-weight:700; font-size:1.1rem;">${r.failed || 0}</td>
+      <td>
+        <div style="font-size:13px; font-weight:600; color:var(--text-primary);">第 ${r.current_round || 0} 轮</div>
+        <div style="font-size:10px; color:var(--text-muted);">共 ${r.rounds || 0} 轮</div>
+      </td>
     `;
     tbody.appendChild(tr);
   });
+}
+
+function renderAuthorizedProfiles() {
+  const tbody = document.getElementById('authorizedProfilesBody');
+  const summaryEl = document.getElementById('authorizedProfilesSummary');
+  if (!tbody) return;
+
+  const rows = state.authorizedProfiles || [];
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="text-muted" style="padding:0.9rem;">当前没有已授权账号</td></tr>';
+    if (summaryEl) summaryEl.textContent = '';
+    return;
+  }
+
+  tbody.innerHTML = '';
+  let successCount = 0;
+  rows.forEach((row) => {
+    if (row.ok) successCount += 1;
+    const tr = document.createElement('tr');
+    const phone = row.phone || '-';
+    const nickname = row.nickname || '-';
+    const about = row.about || '-';
+    tr.innerHTML = `
+      <td style="font-weight:600;">${row.account || '-'}</td>
+      <td>${row.ok ? phone : '<span class="status-error">读取失败</span>'}</td>
+      <td>${row.ok ? nickname : '-'}</td>
+      <td title="${row.ok ? about : (row.error || '')}">${row.ok ? about : (row.error || '-')}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  if (summaryEl) summaryEl.textContent = `成功读取 ${successCount}/${rows.length}`;
+}
+
+async function fetchAuthorizedProfiles(force = false) {
+  const tbody = document.getElementById('authorizedProfilesBody');
+  const btn = document.getElementById('refreshAuthorizedProfiles');
+  if (!tbody || !state.token) return;
+
+  if (btn && force) btn.disabled = true;
+  tbody.innerHTML = '<tr><td colspan="4" class="text-muted" style="padding:0.9rem;">读取中...</td></tr>';
+
+  try {
+    const res = await fetch('/api/accounts/profiles-authorized', {
+      headers: { 'X-Admin-Token': state.token }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || '读取失败');
+    }
+    state.authorizedProfiles = Array.isArray(data.profiles) ? data.profiles : [];
+    renderAuthorizedProfiles();
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="status-error" style="padding:0.9rem;">读取失败: ${e.message}</td></tr>`;
+    const summaryEl = document.getElementById('authorizedProfilesSummary');
+    if (summaryEl) summaryEl.textContent = '';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function applySummaryFilter() {
@@ -135,10 +217,12 @@ function sortSummary(key) {
   state.summarySortKey = key; state.summarySortAsc = asc;
   const arr = (state.summary || []).slice();
   arr.sort((a,b) => {
-    const aProcessed = (a.processed != null) ? (a.processed || 0) : ((a.success || 0) + (a.failed || 0));
-    const bProcessed = (b.processed != null) ? (b.processed || 0) : ((b.success || 0) + (b.failed || 0));
-    const va = (key === 'progress') ? ((a.total||0) ? aProcessed/(a.total||0) : 0) : (a[key] || 0);
-    const vb = (key === 'progress') ? ((b.total||0) ? bProcessed/(b.total||0) : 0) : (b[key] || 0);
+    const aProcessed = (a.overall_completed != null) ? (a.overall_completed || 0) : ((a.progress_completed != null) ? (a.progress_completed || 0) : ((a.completed != null) ? (a.completed || 0) : ((a.success || 0) + (a.failed || 0))));
+    const bProcessed = (b.overall_completed != null) ? (b.overall_completed || 0) : ((b.progress_completed != null) ? (b.progress_completed || 0) : ((b.completed != null) ? (b.completed || 0) : ((b.success || 0) + (b.failed || 0))));
+    const aTotal = (a.overall_planned != null) ? (a.overall_planned || 0) : ((a.progress_total != null) ? (a.progress_total || 0) : (a.total || 0));
+    const bTotal = (b.overall_planned != null) ? (b.overall_planned || 0) : ((b.progress_total != null) ? (b.progress_total || 0) : (b.total || 0));
+    const va = (key === 'progress') ? (aTotal ? aProcessed / aTotal : 0) : (a[key] || 0);
+    const vb = (key === 'progress') ? (bTotal ? bProcessed / bTotal : 0) : (b[key] || 0);
     if (typeof va === 'string' || typeof vb === 'string') return asc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
     return asc ? (va - vb) : (vb - va);
   });
@@ -260,7 +344,7 @@ function renderGroups() {
             <span>${g.member_count ? `${g.member_count}人` : ''}</span>
             <span>${badge}</span>
             ${g.username ? `<span>@${g.username}</span>` : ''}
-            ${disabled ? `<span style="color:var(--error)">不可发送</span>` : ''}
+            ${disabled ? '<span class="group-warning-badge">不可发送</span>' : ''}
           </div>
         </div>
       </label>
@@ -318,7 +402,7 @@ async function send(path) {
   const msg = document.getElementById('message').value;
   const parseMode = document.getElementById('parseMode').value;
   const delayMs = parseInt(document.getElementById('delayMs').value || '60000');
-  const rounds = parseInt(document.getElementById('rounds')?.value || '1');
+  const rounds = parseInt(document.getElementById('rounds')?.value || '100');
   const roundInterval = parseInt(document.getElementById('roundInterval')?.value || '1200');
   const disablePreview = document.getElementById('disablePreview').checked;
   if (!ids.length) { alert('请选择至少一个群'); state.sending = false; if (sendBtn) sendBtn.disabled = false; if (testBtn) testBtn.disabled = false; return; }
@@ -382,15 +466,41 @@ async function pollTaskUntilDone(taskId, resultEl) {
         const res = await fetch(`/api/task-status?task_id=${encodeURIComponent(taskId)}`, { headers: { 'X-Admin-Token': state.token } });
         if (!res.ok) return;
         const s = await res.json();
-        const roundInfo = (s.rounds && s.current_round) ? `｜轮次 ${s.current_round}/${s.rounds}` : '';
-        if (resultEl) resultEl.textContent = `总数 ${s.total}｜成功 ${s.success}｜失败 ${s.failed}${roundInfo}`;
-        if (s.status === 'done') {
+        
+        const overallPlanned = s.overall_planned || s.total || 0;
+        const overallCompleted = s.overall_completed || (s.success || 0) + (s.failed || 0);
+        const roundInfo = (s.rounds && s.current_round) ? `｜第 ${s.current_round}/${s.rounds} 轮` : '';
+        const roundProgress = (s.current_round_planned != null)
+          ? `｜本轮 ${s.current_round_sent || 0}/${s.current_round_planned || 0}`
+          : `｜进度 ${overallCompleted}/${overallPlanned}`;
+        
+        if (resultEl) {
+          resultEl.innerHTML = `
+            <div style="display:flex; flex-direction:column; gap:4px; width:100%;">
+              <div style="display:flex; justify-content:space-between; font-weight:700;">
+                <span>任务执行中...</span>
+                <span class="status-success">成功 ${s.success || 0}</span>
+                <span class="status-error">失败 ${s.failed || 0}</span>
+              </div>
+              <div style="font-size:12px; color:var(--text-secondary);">
+                ${roundProgress}${roundInfo}｜总体 ${overallCompleted}/${overallPlanned}
+              </div>
+            </div>
+          `;
+        }
+        
+        if (s.status === 'done' || s.status === 'stopped' || s.status === 'error') {
           clearInterval(timer);
+          if (resultEl) {
+            const statusText = s.status === 'done' ? '任务已完成' : (s.status === 'stopped' ? '任务已停止' : '任务发生错误');
+            resultEl.innerHTML = `<strong>${statusText}</strong>｜成功 ${s.success}｜失败 ${s.failed}`;
+          }
           await fetchLogs();
+          await fetchGlobalSummary(true);
           resolve();
         }
       } catch {}
-    }, 1000);
+    }, 1500);
   });
 }
 
@@ -403,6 +513,15 @@ async function fetchLogs() {
   updateText('overviewLogCount', String(Array.isArray(data) ? data.length : 0));
   const tbody = document.getElementById('logsBody');
   tbody.innerHTML = '';
+  const formatLogTime = (value) => {
+    if (!value) return '';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) {
+      return String(value).replace('T', ' ').slice(0, 19);
+    }
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
   data.forEach(r => {
     const status = (r.status || '').toLowerCase();
     const statusClass = status === 'success'
@@ -410,7 +529,7 @@ async function fetchLogs() {
       : (status === 'failed' ? 'log-status-failed' : 'log-status-info');
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td style="color:var(--text-muted); font-size:11px;">${r.created_at ? r.created_at.split(' ')[1] : ''}</td>
+      <td style="color:var(--text-muted); font-size:11px;">${formatLogTime(r.created_at)}</td>
       <td style="font-size:11px; font-weight:500;">${r.account_name || ''}</td>
       <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${r.group_title || r.group_id}</td>
       <td><span class="log-status ${statusClass}">${r.status || '-'}</span></td>
@@ -514,6 +633,10 @@ function bindEvents() {
   if (summarySearch) {
     summarySearch.addEventListener('input', applySummaryFilter);
   }
+  const refreshAuthorizedProfilesBtn = document.getElementById('refreshAuthorizedProfiles');
+  if (refreshAuthorizedProfilesBtn) {
+    refreshAuthorizedProfilesBtn.addEventListener('click', () => fetchAuthorizedProfiles(true));
+  }
   document.querySelectorAll('.summarySort').forEach(el => {
     el.addEventListener('click', () => sortSummary(el.getAttribute('data-key')));
   });
@@ -525,6 +648,10 @@ function bindEvents() {
       localStorage.setItem('selectedAccount', state.account);
       fetchGroups(true);
       fetchAuthStatus();
+      const accountManageModal = document.getElementById('accountManageModal');
+      if (accountManageModal && !accountManageModal.classList.contains('hidden')) {
+        loadCurrentAccountProfile();
+      }
       try {
         const inp = document.getElementById('loginPhone');
         if (inp) inp.value = '';
@@ -621,6 +748,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   bindEvents();
   await fetchAccounts();
   await fetchAuthStatus();
+  await fetchAuthorizedProfiles(true);
   renderGroupsFromCacheIfAvailable();
   await fetchGroups();
   await fetchLogs();
@@ -1007,12 +1135,15 @@ function setupAccountManage() {
   const uploadBtn = document.getElementById('uploadSessionBtn');
   const batchJoinBtn = document.getElementById('batchJoinBtn');
   const openCleanupBtn = document.getElementById('openAuthorizedCleanup');
+  const loadProfileBtn = document.getElementById('loadProfileBtn');
+  const saveProfileBtn = document.getElementById('saveProfileBtn');
   
   if (!modal || !openBtn) return;
   
   openBtn.addEventListener('click', () => {
     modal.classList.remove('hidden');
     loadAccountList();
+    loadCurrentAccountProfile();
   });
   
   closeBtn.addEventListener('click', () => {
@@ -1021,6 +1152,8 @@ function setupAccountManage() {
   
   uploadBtn.addEventListener('click', uploadSessionFiles);
   batchJoinBtn?.addEventListener('click', batchJoinGroups);
+  loadProfileBtn?.addEventListener('click', loadCurrentAccountProfile);
+  saveProfileBtn?.addEventListener('click', saveCurrentAccountProfile);
 
   if (openCleanupBtn) {
     openCleanupBtn.addEventListener('click', () => {
@@ -1031,6 +1164,29 @@ function setupAccountManage() {
       }
     });
   }
+}
+
+function openProfileEditorInAccountManage() {
+  const modal = document.getElementById('accountManageModal');
+  const section = document.getElementById('profileEditorSection');
+  const nicknameInput = document.getElementById('profileNickname');
+
+  if (!modal) return;
+
+  modal.classList.remove('hidden');
+  loadAccountList();
+  loadCurrentAccountProfile();
+
+  setTimeout(() => {
+    if (section) section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (nicknameInput) nicknameInput.focus();
+  }, 80);
+}
+
+function setupQuickProfileEditorButton() {
+  const btn = document.getElementById('openQuickProfileEditor');
+  if (!btn) return;
+  btn.addEventListener('click', openProfileEditorInAccountManage);
 }
 
 async function loadAuthorizedAccounts() {
@@ -1113,6 +1269,7 @@ async function deleteAuthorizedAccount(account) {
   await loadAuthorizedAccounts();
   await fetchAccounts();
   await fetchAuthStatus();
+  await fetchAuthorizedProfiles(true);
 }
 
 async function deleteAllAuthorizedAccounts() {
@@ -1141,6 +1298,7 @@ async function deleteAllAuthorizedAccounts() {
   await loadAuthorizedAccounts();
   await fetchAccounts();
   await fetchAuthStatus();
+  await fetchAuthorizedProfiles(true);
 }
 
 async function loadAccountList() {
@@ -1168,6 +1326,102 @@ async function loadAccountList() {
     
   } catch (e) {
     container.innerHTML = `<p class="text-danger text-sm">加载失败: ${e.message}</p>`;
+  }
+}
+
+async function loadCurrentAccountProfile() {
+  const statusEl = document.getElementById('profileStatus');
+  const nicknameEl = document.getElementById('profileNickname');
+  const aboutEl = document.getElementById('profileAbout');
+
+  if (!state.account) {
+    if (statusEl) {
+      statusEl.textContent = '请先选择账号';
+      statusEl.className = 'text-sm status-error';
+    }
+    return;
+  }
+
+  if (statusEl) {
+    statusEl.textContent = '读取中...';
+    statusEl.className = 'text-sm text-muted';
+  }
+
+  try {
+    const res = await fetch(`/api/accounts/profile?account=${encodeURIComponent(state.account)}`, {
+      headers: { 'X-Admin-Token': state.token }
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || '读取失败');
+    }
+    if (nicknameEl) nicknameEl.value = data.nickname || data.first_name || '';
+    if (aboutEl) aboutEl.value = data.about || '';
+    if (statusEl) {
+      statusEl.textContent = `已读取 ${state.account} 的资料，可作为批量修改模板`;
+      statusEl.className = 'text-sm status-success';
+    }
+  } catch (e) {
+    if (statusEl) {
+      statusEl.textContent = `读取失败: ${e.message}`;
+      statusEl.className = 'text-sm status-error';
+    }
+  }
+}
+
+async function saveCurrentAccountProfile() {
+  const statusEl = document.getElementById('profileStatus');
+  const nickname = document.getElementById('profileNickname')?.value?.trim() || '';
+  const about = document.getElementById('profileAbout')?.value?.trim() || '';
+  const btn = document.getElementById('saveProfileBtn');
+
+  if (!nickname) {
+    alert('请输入账号昵称');
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  if (statusEl) {
+    statusEl.textContent = '保存中...';
+    statusEl.className = 'text-sm text-muted';
+  }
+
+  try {
+    const res = await fetch('/api/accounts/profile', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Token': state.token
+      },
+      body: JSON.stringify({
+        nickname,
+        about
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || '保存失败');
+    }
+    if (statusEl) {
+      const failedAccounts = Object.entries(data.results || {})
+        .filter(([, result]) => result && result.ok === false)
+        .map(([account, result]) => `${account}: ${result.error || '失败'}`);
+      let text = `批量保存完成：成功 ${data.success_count || 0} / ${data.accounts_total || 0}`;
+      if ((data.failed_count || 0) > 0 && failedAccounts.length) {
+        text += `\n失败 ${data.failed_count} 个：\n${failedAccounts.join('\n')}`;
+      }
+      statusEl.textContent = text;
+      statusEl.className = `text-sm ${(data.failed_count || 0) > 0 ? 'status-warning' : 'status-success'}`;
+    }
+    await fetchAccounts();
+    await fetchAuthorizedProfiles(true);
+  } catch (e) {
+    if (statusEl) {
+      statusEl.textContent = `保存失败: ${e.message}`;
+      statusEl.className = 'text-sm status-error';
+    }
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -1201,6 +1455,7 @@ async function uploadSessionFiles() {
       fileInput.value = '';
       loadAccountList();
       fetchAuthStatus(); // Refresh account list
+      fetchAuthorizedProfiles(true);
     } else {
       statusEl.textContent = `上传失败: ${data.detail || '未知错误'}`;
     }
@@ -1371,7 +1626,7 @@ async function startBatchSend() {
   // 获取发送参数
   const parseMode = document.getElementById('parseMode')?.value || 'plain';
   const delayMs = parseInt(document.getElementById('delayMs')?.value) || 11000;
-  const rounds = parseInt(document.getElementById('rounds')?.value) || 1;
+  const rounds = parseInt(document.getElementById('rounds')?.value) || 100;
   const roundIntervalS = parseInt(document.getElementById('roundInterval')?.value) || 600;
   const disablePreview = document.getElementById('disablePreview')?.checked ?? true;
   
@@ -1430,6 +1685,7 @@ async function startBatchSend() {
 // Initialize new features
 document.addEventListener('DOMContentLoaded', () => {
   setupAccountManage();
+  setupQuickProfileEditorButton();
   setupResetSystem();
   setupBatchSend();
   setupLoginTabs();

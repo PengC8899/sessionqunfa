@@ -329,6 +329,7 @@ class MultiAccountSender:
                             error=result.error,
                             message_id=result.message_id,
                             parse_mode=parse_mode,
+                            created_at=CONFIG.now(),
                         )
                         db.add(log)
                         

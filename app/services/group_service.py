@@ -50,6 +50,167 @@ def should_exclude_group_on_error(error_text: str | None) -> bool:
         return True
     return False
 
+
+
+
+def classify_error_type(error_text: str | None) -> str:
+    """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
+    if not error_text:
+        return "unknown"
+    
+    err = str(error_text).lower()
+    
+    # 永久错误 - 应该拉黑
+    permanent_markers = (
+        "banned from sending messages",
+        "user_banned_in_channel",
+        "chat_write_forbidden",
+        "chat_send_plain_forbidden",
+        "chat_send_media_forbidden",
+        "peer error",
+        "invalid peer",
+        "could not find the input entity",
+        "peer_is_user",
+        "the chat is restricted and cannot be used in that request",
+        "chat restricted",
+        "channel_private",
+        "session database corrupted",
+        "not authorized",
+    )
+    
+    # 临时错误 - 不应该拉黑
+    temporary_markers = (
+        "floodwait",
+        "a wait of",
+        "seconds is required",
+        "too many requests",
+        "retry after",
+        "timeout",
+        "network error",
+        "connection reset",
+        "connection refused",
+    )
+    
+    if any(marker in err for marker in permanent_markers):
+        return "permanent"
+    elif any(marker in err for marker in temporary_markers):
+        return "temporary"
+    else:
+        return "unknown"
+
+
+def should_add_to_blist(error_text: str | None) -> bool:
+    """判断是否应该将群组加入黑名单"""
+    error_type = classify_error_type(error_text)
+    # 只有永久错误才加入黑名单
+    return error_type == "permanent"
+
+
+def classify_error_type(error_text: str | None) -> str:
+    """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
+    if not error_text:
+        return "unknown"
+    
+    err = str(error_text).lower()
+    
+    # 永久错误 - 应该拉黑
+    permanent_markers = (
+        "banned from sending messages",
+        "user_banned_in_channel",
+        "chat_write_forbidden",
+        "chat_send_plain_forbidden",
+        "chat_send_media_forbidden",
+        "peer error",
+        "invalid peer",
+        "could not find the input entity",
+        "peer_is_user",
+        "the chat is restricted and cannot be used in that request",
+        "chat restricted",
+        "channel_private",
+        "session database corrupted",
+        "not authorized",
+    )
+    
+    # 临时错误 - 不应该拉黑
+    temporary_markers = (
+        "floodwait",
+        "a wait of",
+        "seconds is required",
+        "too many requests",
+        "retry after",
+        "timeout",
+        "network error",
+        "connection reset",
+        "connection refused",
+    )
+    
+    if any(marker in err for marker in permanent_markers):
+        return "permanent"
+    elif any(marker in err for marker in temporary_markers):
+        return "temporary"
+    else:
+        return "unknown"
+
+
+def should_add_to_blist(error_text: str | None) -> bool:
+    """判断是否应该将群组加入黑名单"""
+    error_type = classify_error_type(error_text)
+    # 只有永久错误才加入黑名单
+    return error_type == "permanent"
+
+
+def classify_error_type(error_text: str | None) -> str:
+    """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
+    if not error_text:
+        return "unknown"
+    
+    err = str(error_text).lower()
+    
+    # 永久错误 - 应该拉黑
+    permanent_markers = (
+        "banned from sending messages",
+        "user_banned_in_channel",
+        "chat_write_forbidden",
+        "chat_send_plain_forbidden",
+        "chat_send_media_forbidden",
+        "peer error",
+        "invalid peer",
+        "could not find the input entity",
+        "peer_is_user",
+        "the chat is restricted and cannot be used in that request",
+        "chat restricted",
+        "channel_private",
+        "session database corrupted",
+        "not authorized",
+    )
+    
+    # 临时错误 - 不应该拉黑
+    temporary_markers = (
+        "floodwait",
+        "a wait of",
+        "seconds is required",
+        "too many requests",
+        "retry after",
+        "timeout",
+        "network error",
+        "connection reset",
+        "connection refused",
+    )
+    
+    if any(marker in err for marker in permanent_markers):
+        return "permanent"
+    elif any(marker in err for marker in temporary_markers):
+        return "temporary"
+    else:
+        return "unknown"
+
+
+def should_add_to_blist(error_text: str | None) -> bool:
+    """判断是否应该将群组加入黑名单"""
+    error_type = classify_error_type(error_text)
+    # 只有永久错误才加入黑名单
+    return error_type == "permanent"
+
 def get_banned_group_ids(db: Session, account: Optional[str] = None) -> list[int]:
     if not account:
         return []

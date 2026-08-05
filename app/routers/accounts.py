@@ -1,6 +1,7 @@
 from starlette.responses import JSONResponse
 from starlette.requests import Request
-from starlette.exceptions import HTTPException
+from telethon.errors.rpcerrorlist import AboutTooLongError, FirstNameInvalidError
+import asyncio
 from app.config import CONFIG
 from app.services.account_service import account_service
 from app.database import SessionLocal
@@ -11,12 +12,38 @@ import os
 import glob
 import uuid
 
+
+def _is_authorized_token(request: Request) -> bool:
+    return request.headers.get("X-Admin-Token") == CONFIG.ADMIN_TOKEN
+
+
+def _translate_profile_update_error(exc: Exception) -> str:
+    err_text = str(exc)
+    if "FROZEN_METHOD_INVALID" in err_text:
+        return "该账号当前被 Telegram 限制，暂时不能修改昵称或简介"
+    if isinstance(exc, AboutTooLongError):
+        return "账号简介过长，请控制在 70 个字符以内"
+    if isinstance(exc, FirstNameInvalidError):
+        return "账号昵称不合法，请换一个昵称再试"
+    return str(exc)
+
+
+def _discover_authorized_accounts() -> list[str]:
+    session_dir = CONFIG.SESSION_DIR
+    files = glob.glob(os.path.join(session_dir, "*.session"))
+    names = []
+    for path in files:
+        name = os.path.basename(path)[:-8]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 async def bulk_update_profile(request: Request):
     """
     批量更新所有账号的个人资料
     """
-    token = request.headers.get("X-Admin-Token")
-    if token != CONFIG.ADMIN_TOKEN:
+    if not _is_authorized_token(request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     
     try:
@@ -63,9 +90,124 @@ async def bulk_update_profile(request: Request):
     except Exception as e:
         return JSONResponse({"detail": str(e)}, status_code=500)
 
+
+async def get_account_profile(request: Request):
+    if not _is_authorized_token(request):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    account = (request.query_params.get("account") or "").strip()
+    if not account:
+        return JSONResponse({"detail": "Missing account"}, status_code=400)
+
+    session_path = os.path.join(CONFIG.SESSION_DIR, f"{account}.session")
+    if not os.path.exists(session_path):
+        return JSONResponse({"detail": "session_not_found"}, status_code=404)
+
+    try:
+        profile = await multi_manager.get_profile(account)
+        return JSONResponse({"ok": True, **profile})
+    except Exception as e:
+        return JSONResponse({"detail": str(e)}, status_code=400)
+
+
+async def get_authorized_profiles(request: Request):
+    if not _is_authorized_token(request):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    accounts = _discover_authorized_accounts()
+    if not accounts:
+        return JSONResponse({"ok": True, "accounts_total": 0, "profiles": []})
+
+    sem = asyncio.Semaphore(4)
+
+    async def fetch_one(account: str):
+        async with sem:
+            try:
+                profile = await multi_manager.get_profile(account)
+                return {
+                    "account": account,
+                    "ok": True,
+                    "phone": profile.get("phone"),
+                    "nickname": profile.get("nickname") or profile.get("first_name") or "",
+                    "about": profile.get("about") or "",
+                }
+            except Exception as e:
+                return {
+                    "account": account,
+                    "ok": False,
+                    "phone": None,
+                    "nickname": "",
+                    "about": "",
+                    "error": str(e),
+                }
+
+    profiles = await asyncio.gather(*(fetch_one(account) for account in accounts))
+    profiles.sort(key=lambda item: item.get("account") or "")
+    return JSONResponse(
+        {
+            "ok": True,
+            "accounts_total": len(accounts),
+            "profiles": profiles,
+        }
+    )
+
+
+async def update_account_profile(request: Request):
+    if not _is_authorized_token(request):
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+
+    nickname = (body.get("nickname") or "").strip()
+    about = body.get("about")
+
+    if not nickname:
+        return JSONResponse({"detail": "Missing nickname"}, status_code=400)
+    if len(nickname) > 64:
+        return JSONResponse({"detail": "nickname_too_long"}, status_code=400)
+    if about is not None:
+        about = str(about).strip()
+        if len(about) > 70:
+            return JSONResponse({"detail": "about_too_long"}, status_code=400)
+
+    accounts = _discover_authorized_accounts()
+    if not accounts:
+        return JSONResponse({"detail": "no_authorized_accounts"}, status_code=400)
+
+    results = {}
+    success_count = 0
+    failed_count = 0
+    sample_profile = None
+
+    for account in accounts:
+        try:
+            profile = await multi_manager.update_text_profile(account, nickname, about)
+            results[account] = {"ok": True, "profile": profile}
+            success_count += 1
+            if sample_profile is None:
+                sample_profile = profile
+        except Exception as e:
+            results[account] = {"ok": False, "error": _translate_profile_update_error(e)}
+            failed_count += 1
+
+    return JSONResponse(
+        {
+            "ok": success_count > 0,
+            "nickname": nickname,
+            "about": about or "",
+            "accounts_total": len(accounts),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "results": results,
+            "sample_profile": sample_profile,
+        }
+    )
+
 async def check_single_account(request: Request):
-    token = request.headers.get("X-Admin-Token")
-    if token != CONFIG.ADMIN_TOKEN:
+    if not _is_authorized_token(request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     
     try:
@@ -86,8 +228,7 @@ async def check_single_account(request: Request):
         )
 
 async def delete_account(request: Request):
-    token = request.headers.get("X-Admin-Token")
-    if token != CONFIG.ADMIN_TOKEN:
+    if not _is_authorized_token(request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
         
     try:
