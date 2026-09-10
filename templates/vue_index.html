@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Telegram 控制面板</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23162033'/%3E%3Cpath d='M14 31.5 48 18c2.6-1 5 1.4 4 4L38.5 50c-.8 1.7-3.2 1.8-4.2.2l-7.1-10.4-8.7-4.1c-1.9-.9-1.8-3.7.1-4.2Z' fill='%234f8cff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/vue-admin.css?v=1.4.9" />
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  {% raw %}
+  <div id="app" v-cloak>
+    <aside class="sidebar" :class="{ open: ui.sidebarOpen }">
+      <div class="brand">
+        <div>
+          <div class="brand-title">TG 控制面板</div>
+          <div class="brand-subtitle">Vue3 + FastAPI</div>
+        </div>
+        <button class="ghost-btn mobile-only" @click="ui.sidebarOpen = false">关闭</button>
+      </div>
+
+      <nav class="nav">
+        <button
+          v-for="item in navItems"
+          :key="item.key"
+          class="nav-item"
+          :class="{ active: ui.activePage === item.key }"
+          @click="setPage(item.key)"
+        >
+          <span class="nav-label">{{ item.label }}</span>
+          <span class="nav-desc">{{ item.desc }}</span>
+        </button>
+      </nav>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <div class="panel-title">群组快选</div>
+            <div class="panel-desc">发送与批量任务直接复用</div>
+          </div>
+          <div class="tiny">{{ filteredGroups.length }} / {{ groups.length }}</div>
+        </div>
+        <div class="field">
+          <input v-model.trim="groupSearch" name="group_search" class="input" placeholder="搜索群组..." />
+        </div>
+        <div class="row">
+          <button class="secondary-btn" @click="selectVisible(true)">全选</button>
+          <button class="secondary-btn" @click="selectVisible(false)">清空</button>
+          <button class="secondary-btn" :disabled="loading.groups" @click="fetchGroups(true)">刷新</button>
+        </div>
+        <label class="checkbox-line">
+          <input type="checkbox" name="include_channels" v-model="includeChannels" @change="onIncludeChannelsChange" />
+          <span>包含频道</span>
+        </label>
+        <div class="panel-hint" :class="groupLoadError ? 'status-danger' : 'status-muted'">{{ groupPanelStatusText }}</div>
+        <div class="group-list">
+          <label
+            v-for="group in filteredGroups"
+            :key="group.id"
+            class="group-item"
+            :class="{ disabled: isGroupDisabled(group) }"
+          >
+            <input
+              type="checkbox"
+              :name="`group_${group.id}`"
+              :checked="selectedIds.has(group.id)"
+              :disabled="isGroupDisabled(group)"
+              @change="toggleGroup(group.id, $event.target.checked)"
+            />
+            <div class="group-copy">
+              <div class="group-title">{{ group.title || group.id }}</div>
+              <div class="group-meta">
+                <span>{{ group.member_count ? `${group.member_count}人` : '未知人数' }}</span>
+                <span>{{ groupBadge(group) }}</span>
+                <span v-if="group.username">@{{ group.username }}</span>
+                <span v-if="isGroupDisabled(group)" class="warn-text">不可发送</span>
+              </div>
+            </div>
+          </label>
+          <div v-if="!filteredGroups.length" class="empty">暂无群组数据</div>
+        </div>
+      </section>
+    </aside>
+
+    <div class="overlay" :class="{ show: ui.sidebarOpen }" @click="ui.sidebarOpen = false"></div>
+
+    <main class="main">
+      <header class="topbar">
+        <form class="row wrap" @submit.prevent="saveToken">
+          <button type="button" class="secondary-btn mobile-only" @click="ui.sidebarOpen = true">菜单</button>
+          <input v-model.trim="tokenInput" name="admin_token" type="password" autocomplete="new-password" class="input token-input" placeholder="管理员令牌" />
+          <button type="submit" class="primary-btn">保存令牌</button>
+          <span class="tiny" :class="tokenStatusClass">{{ tokenStatus }}</span>
+        </form>
+        <div class="row wrap">
+          <select v-model="selectedAccount" name="selected_account" class="select" @change="onAccountChange">
+            <option v-for="account in accounts" :key="account.account" :value="account.account">
+              {{ account.account }}{{ account.authorized ? ' (已授权)' : '' }}
+            </option>
+          </select>
+          <button class="secondary-btn" @click="fetchDashboard(true)">刷新总览</button>
+          <span class="tiny" :class="statusClass(authStatusText)">{{ selectedAccountSummary() }}</span>
+        </div>
+      </header>
+
+      <section v-if="notice.message" class="notice" :class="notice.type">{{ notice.message }}</section>
+
+      <section v-show="ui.activePage === 'dashboard'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>总览</h1>
+            <p>当前账号、群组、任务、日志和授权状态一屏可见。</p>
+          </div>
+          <div class="stats-grid">
+            <div class="stat-card">
+              <span>账号数</span>
+              <strong>{{ accounts.length }}</strong>
+            </div>
+            <div class="stat-card">
+              <span>已选群组</span>
+              <strong>{{ selectedIds.size }}</strong>
+            </div>
+            <div class="stat-card">
+              <span>运行任务</span>
+              <strong>{{ runningTaskCount }}</strong>
+            </div>
+            <div class="stat-card">
+              <span>最近日志</span>
+              <strong>{{ logs.length }}</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <section class="card">
+            <div class="card-head">
+              <h2>任务摘要</h2>
+              <div class="row">
+                <button class="secondary-btn" @click="fetchTasksSummary(true)">刷新</button>
+                <button class="danger-btn" @click="clearAllTasks">清空全部任务</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>状态</th>
+                    <th>当前轮进度</th>
+                    <th>轮次</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in tasksSummary" :key="item.task_id">
+                    <td>{{ item.account }}</td>
+                    <td><span :class="statusClass(item.status, 'task')">{{ formatStatusLabel(item.status) }}</span></td>
+                    <td>
+                      <div>{{ item.current_round_sent || item.progress_completed || 0 }} / {{ item.current_round_planned || item.progress_total || item.total || 0 }}</div>
+                      <div class="tiny">累计 {{ item.overall_completed || 0 }} 次</div>
+                      <div v-if="item.status === 'waiting_next_round' && item.next_round_at" class="tiny">
+                        下轮时间：{{ formatTime(item.next_round_at) }}
+                      </div>
+                      <div v-if="item.status === 'no_sendable_groups'" class="tiny">
+                        当前账号已经没有剩余可发群
+                      </div>
+                    </td>
+                    <td>{{ item.current_round || 0 }} / {{ item.rounds || 0 }}</td>
+                    <td class="row-actions">
+                      <button class="tiny-btn" @click="controlTask(item.task_id, 'pause')">暂停</button>
+                      <button class="tiny-btn" @click="controlTask(item.task_id, 'resume')">恢复</button>
+                      <button class="tiny-btn danger" @click="controlTask(item.task_id, 'stop')">停止</button>
+                      <button class="tiny-btn danger" @click="deleteTask(item.task_id)">删除</button>
+                    </td>
+                  </tr>
+                  <tr v-if="!tasksSummary.length">
+                    <td colspan="5" class="empty-cell">当前没有任务</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <div>
+                <h2>最近日志</h2>
+                <div class="tiny status-muted">{{ logsAutoRefreshText }}</div>
+              </div>
+              <div class="row">
+                <button class="secondary-btn" @click="fetchLogs">刷新</button>
+                <button class="danger-btn" @click="clearLogs">清空日志</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>账号</th>
+                    <th>目标</th>
+                    <th>状态</th>
+                    <th>详情</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in logs" :key="row.id">
+                    <td>{{ formatTime(row.created_at) }}</td>
+                    <td>{{ row.account_name || '-' }}</td>
+                    <td>{{ row.group_title || row.group_id || '-' }}</td>
+                    <td><span :class="statusClass(row.status, 'log')">{{ formatStatusLabel(row.status) }}</span></td>
+                    <td>{{ formatLogDetail(row) }}</td>
+                  </tr>
+                  <tr v-if="!logs.length">
+                    <td colspan="5" class="empty-cell">暂无日志</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section v-show="ui.activePage === 'accounts'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>账号管理</h1>
+            <p>登录、上传 Session、读取资料、批量修改、删除当前账号。</p>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <section class="card">
+            <div class="card-head"><h2>验证码登录</h2></div>
+            <form class="form-grid" @submit.prevent="submitLoginCode">
+              <input v-model.trim="login.phone" name="login_phone" autocomplete="tel" class="input" placeholder="手机号（带国家码）" />
+              <div class="row">
+                <input v-model.trim="login.code" name="login_code" autocomplete="one-time-code" class="input" placeholder="验证码" />
+                <button type="button" class="secondary-btn" :disabled="!selectedAccount || !login.phone" @click="sendLoginCode">发送验证码</button>
+              </div>
+              <input v-model.trim="login.password" name="login_password" type="password" autocomplete="current-password" class="input" placeholder="二次密码（可选）" />
+              <label class="checkbox-line">
+                <input type="checkbox" name="force_sms" v-model="login.forceSms" />
+                <span>强制短信验证</span>
+              </label>
+              <button type="submit" class="primary-btn" :disabled="!selectedAccount || !login.phone || !login.code">确认登录</button>
+              <div class="tiny" :class="statusClass(authStatusText)">{{ authStatusText }}</div>
+            </form>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h2>Session 上传</h2></div>
+            <div class="form-grid">
+              <input ref="sessionUploadInput" name="session_upload" type="file" multiple accept=".session,.zip,application/zip" class="input file-input" />
+              <textarea v-model.trim="sessionProxyBindingsText" name="session_proxy_source" class="textarea" placeholder="可选：上传时自动绑定代理（一账号一代理）&#10;支持三种写法：&#10;1. 账号名|socks5://user:pass@host:port&#10;2. 纯代理列表，每行一个，按上传顺序自动分配&#10;3. 代理 API 地址（返回纯文本代理列表，支持从 URL 自动识别 proto=http / socks5）"></textarea>
+              <button class="primary-btn" @click="uploadSessions">上传 Session / ZIP</button>
+              <textarea v-model.trim="joinLinksText" name="join_links" class="textarea" placeholder="群组链接，每行一个"></textarea>
+              <div class="context-grid compact">
+                <div class="context-card">
+                  <span>当前账号</span>
+                  <strong>{{ selectedAccount || '未选择' }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>可用账号</span>
+                  <strong>{{ accounts.filter((item) => item.authorized).length }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>待加入链接</span>
+                  <strong>{{ joinLinksText ? joinLinksText.split('\n').filter(Boolean).length : 0 }}</strong>
+                </div>
+              </div>
+              <div class="row">
+                <button class="secondary-btn" :disabled="loading.groupJoin || !selectedAccount || !joinLinksText.trim()" @click="joinGroupsForCurrentAccount">当前账号加入群组</button>
+                <button class="secondary-btn" :disabled="loading.groupJoin || !canRunJoinActions" @click="batchJoinGroups">多账号分配加入</button>
+                <button class="secondary-btn" :disabled="loading.groupJoin || !canRunJoinActions" @click="joinAllAccounts">{{ loading.groupJoin ? '执行中...' : '全部账号加入同一群' }}</button>
+              </div>
+              <div class="context-grid compact" v-if="joinProgress.total">
+                <div class="context-card">
+                  <span>总进度</span>
+                  <strong>{{ joinProgress.completed }} / {{ joinProgress.total }}（{{ joinProgressPercent }}%）</strong>
+                </div>
+                <div class="context-card">
+                  <span>结果汇总</span>
+                  <strong>成功 {{ joinProgress.success }} / 已加入 {{ joinProgress.alreadyJoined }} / 失败 {{ joinProgress.failed }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>当前执行</span>
+                  <strong>{{ joinProgress.current || '等待开始' }}</strong>
+                </div>
+              </div>
+              <div class="result-box small">{{ joinActionResult || '这里会显示加群执行进度和结果' }}</div>
+              <div class="table-wrap" v-if="joinProgress.rows.length">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>账号</th>
+                      <th>链接</th>
+                      <th>状态</th>
+                      <th>详情</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="item in joinProgress.rows" :key="item.key">
+                      <td>{{ item.account }}</td>
+                      <td>{{ item.invite_link }}</td>
+                      <td><span :class="statusClass(item.status)">{{ item.status }}</span></td>
+                      <td>{{ translateText(item.detail) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div class="grid two">
+          <section class="card">
+            <div class="card-head">
+              <h2>代理绑定</h2>
+              <button class="secondary-btn" :disabled="!selectedAccount" @click="loadProxyForSelectedAccount">读取当前账号代理</button>
+            </div>
+            <div class="form-grid">
+              <div class="tiny">当前账号：{{ selectedAccount || '未选择' }}</div>
+              <input v-model.trim="proxyForm.proxy_url" name="proxy_url" class="input" placeholder="socks5://user:pass@host:port 或 host:port" />
+              <label class="checkbox-line">
+                <input type="checkbox" name="proxy_enabled" v-model="proxyForm.enabled" />
+                <span>启用该代理</span>
+              </label>
+              <button class="primary-btn" :disabled="!selectedAccount" @click="saveProxyForSelectedAccount">保存当前账号代理</button>
+              <div class="result-box small">{{ proxySaveResult || '这里会显示当前账号代理保存结果' }}</div>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>资料编辑</h2>
+              <button class="secondary-btn" :disabled="!selectedAccount" @click="loadAccountProfile">读取当前资料</button>
+            </div>
+            <div class="form-grid">
+              <input v-model.trim="profile.nickname" name="profile_nickname" class="input" placeholder="昵称" />
+              <textarea v-model.trim="profile.about" name="profile_about" class="textarea" placeholder="简介（70字内）"></textarea>
+              <button class="primary-btn" :disabled="!authorizedAccountCount" @click="saveAccountProfile">批量保存到所有已授权账号</button>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>已授权账号</h2>
+              <div class="row">
+                <button class="secondary-btn" @click="fetchAuthorizedProfiles(true)">刷新资料</button>
+                <button class="danger-btn" :disabled="loading.deleteAccounts" @click="clearUnauthorizedAccounts">
+                  {{ loading.deleteAccounts ? '执行中...' : `清理未授权账号（${unauthorizedAccountCount}）` }}
+                </button>
+                <button class="danger-btn" :disabled="loading.deleteAccounts" @click="deleteAllAuthorizedAccounts">
+                  {{ loading.deleteAccounts ? '执行中...' : `清空当前账号（${accounts.length}）` }}
+                </button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>手机号</th>
+                    <th>昵称</th>
+                    <th>代理</th>
+                    <th>简介</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in authorizedProfiles" :key="row.account">
+                    <td>{{ row.account }}</td>
+                    <td>{{ row.phone || '-' }}</td>
+                    <td>{{ row.nickname || '-' }}</td>
+                    <td>{{ formatProxy(row.proxy) }}</td>
+                    <td>{{ formatProfileAbout(row) }}</td>
+                    <td><button class="tiny-btn danger" :disabled="loading.deleteAccounts" @click="deleteAuthorizedAccount(row.account)">删除</button></td>
+                  </tr>
+                  <tr v-if="!authorizedProfiles.length">
+                    <td colspan="6" class="empty-cell">暂无授权账号</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section v-show="ui.activePage === 'groups'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>群组管理</h1>
+            <p>缓存清理、群组预览、不可发送目标识别。</p>
+          </div>
+          <div class="row">
+            <button class="secondary-btn" @click="fetchGroups(true)">刷新群组</button>
+            <button class="danger-btn" @click="clearGroupCache">清理缓存</button>
+          </div>
+        </div>
+        <section class="card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>标题</th>
+                  <th>ID</th>
+                  <th>类型</th>
+                  <th>成员</th>
+                  <th>用户名</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="group in filteredGroups" :key="group.id">
+                  <td>{{ group.title || '-' }}</td>
+                  <td>{{ group.id }}</td>
+                  <td>{{ groupBadge(group) }}</td>
+                  <td>{{ group.member_count || '-' }}</td>
+                  <td>{{ group.username ? `@${group.username}` : '-' }}</td>
+                </tr>
+                <tr v-if="!filteredGroups.length">
+                  <td colspan="5" class="empty-cell">暂无群组</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section v-show="ui.activePage === 'send'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>邀请任务</h1>
+            <p>单账号异步发送、测试发送、全账号批量群发。</p>
+          </div>
+        </div>
+        <div class="grid two">
+          <section class="card">
+            <div class="form-grid">
+              <div class="context-grid">
+                <div class="context-card">
+                  <span>当前账号</span>
+                  <strong>{{ selectedAccount || '未选择' }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>已选群组</span>
+                  <strong>{{ selectedGroupCount }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>已授权账号</span>
+                  <strong>{{ authorizedAccountCount }}</strong>
+                </div>
+                <div class="context-card">
+                  <span>最近分配加入</span>
+                  <strong>{{ distributedJoinPlanAccountCount }} 个账号 / {{ distributedJoinPlanGroupCount }} 个群</strong>
+                </div>
+              </div>
+              <textarea v-model="sendForm.message" name="send_message" class="textarea tall" placeholder="输入消息内容，支持普通文本 / Markdown / HTML / PostBot 指令 / 频道消息链接"></textarea>
+              <div class="row wrap">
+                <select v-model="sendForm.parse_mode" name="parse_mode" class="select">
+                  <option value="plain">plain</option>
+                  <option value="markdown">markdown</option>
+                  <option value="html">html</option>
+                </select>
+                <select v-model="sendForm.batch_mode" name="batch_mode" class="select">
+                  <option value="broadcast_all">全账号发选中群</option>
+                  <option value="distributed_join">按最近分配加入结果群发</option>
+                </select>
+                <input v-model.number="sendForm.delay_ms" name="delay_ms" type="number" min="0" class="input short" placeholder="间隔 ms" />
+                <input v-model.number="sendForm.rounds" name="rounds" type="number" min="1" class="input short" placeholder="轮数" />
+                <input v-model.number="sendForm.round_interval_s" name="round_interval_s" type="number" min="0" class="input short" placeholder="轮次间隔 s" />
+              </div>
+              <div class="tiny">
+                当前批量模式：
+                {{ sendForm.batch_mode === 'distributed_join'
+                  ? `每个账号只发自己最近一次“多账号分配加入”成功加入的群（当前记录 ${distributedJoinPlanGroupCount} 个群）`
+                  : '所有已授权账号都发到你当前选中的群组' }}
+              </div>
+              <label class="checkbox-line">
+                <input type="checkbox" name="disable_preview" v-model="sendForm.disable_web_page_preview" />
+                <span>禁用链接预览</span>
+              </label>
+              <div class="row wrap">
+                <button class="primary-btn" :disabled="loading.send || !canStartSend" @click="startSend">{{ loading.send ? '执行中...' : '发送到选中群组' }}</button>
+                <button class="secondary-btn" :disabled="loading.send || !canStartSend" @click="testSend">{{ loading.send ? '执行中...' : '测试发送' }}</button>
+                <button class="primary-btn" :disabled="loading.send || !canStartBatchSend" @click="startBatchSend">{{ loading.send ? '执行中...' : '已授权账号批量群发' }}</button>
+              </div>
+              <div class="result-box">{{ sendResult || '这里会显示任务创建结果、测试发送结果和轮次进度' }}</div>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head">
+              <h2>任务控制</h2>
+              <div class="row">
+                <button class="danger-btn" @click="stopAllTasks">停止当前账号全部任务</button>
+                <button class="danger-btn" @click="clearAllTasks">批量删除所有任务</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>任务 ID</th>
+                    <th>账号</th>
+                    <th>状态</th>
+                    <th>成功</th>
+                    <th>失败</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="task in tasks" :key="task.task_id">
+                    <td>{{ task.task_id }}</td>
+                    <td>{{ task.account }}</td>
+                    <td><span :class="statusClass(task.status, 'task')">{{ formatStatusLabel(task.status) }}</span></td>
+                    <td>{{ task.success || 0 }}</td>
+                    <td>{{ task.failed || 0 }}</td>
+                    <td class="row-actions">
+                      <button class="tiny-btn" @click="controlTask(task.task_id, 'pause')">暂停</button>
+                      <button class="tiny-btn" @click="controlTask(task.task_id, 'resume')">恢复</button>
+                      <button class="tiny-btn danger" @click="controlTask(task.task_id, 'stop')">停止</button>
+                      <button class="tiny-btn danger" @click="deleteTask(task.task_id)">删除</button>
+                    </td>
+                  </tr>
+                  <tr v-if="!tasks.length">
+                    <td colspan="6" class="empty-cell">暂无任务</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section v-show="ui.activePage === 'protocols'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>协议号批量</h1>
+            <p>支持 `.session` 和 `.zip`，默认直接使用当前上传账号集批量加群；如果做过验证，则优先使用验证通过账号。</p>
+          </div>
+        </div>
+        <div class="grid two">
+          <section class="card">
+            <div class="card-head"><h2>上传与验证</h2></div>
+            <div class="form-grid">
+              <input ref="protocolUploadInput" name="protocol_upload" type="file" multiple accept=".session,.zip,application/zip" class="input file-input" />
+              <textarea v-model.trim="protocolProxyBindingsText" name="protocol_proxy_source" class="textarea" placeholder="可选：协议号上传时自动绑定代理（一账号一代理）&#10;支持 账号|代理、纯代理列表、代理 API 地址（自动识别 proto=http / socks5）"></textarea>
+              <div class="row">
+                <button class="primary-btn" @click="uploadProtocolFiles">上传协议号</button>
+                <button class="secondary-btn" :disabled="!protocolAccounts.length" @click="verifyProtocolAccounts">开始验证</button>
+                <button class="secondary-btn" :disabled="!protocolValidAccounts.length" @click="assignProtocols">加入账号序列</button>
+              </div>
+              <div class="result-box small">{{ protocolResult || '这里会显示协议号上传、验证和加入序列结果' }}</div>
+              <div class="tiny">当前上传账号集 {{ uploadedAccounts.length }} 个，协议号已上传 {{ protocolAccounts.length }} 个，验证通过 {{ protocolValidAccounts.length }} 个</div>
+            </div>
+          </section>
+
+          <section class="card">
+            <div class="card-head"><h2>批量加群</h2></div>
+            <div class="form-grid">
+              <textarea v-model.trim="protocolLinksText" name="protocol_links" class="textarea" placeholder="群组链接，每行一个"></textarea>
+              <div class="row wrap">
+                <input v-model.number="protocolJoin.accountDelay" name="protocol_account_delay" type="number" min="1" class="input short" placeholder="账号间隔 秒" />
+                <input v-model.number="protocolJoin.groupDelay" name="protocol_group_delay" type="number" min="1" class="input short" placeholder="群组间隔 秒" />
+              </div>
+              <button class="primary-btn" :disabled="loading.protocolJoin || !canRunProtocolJoin" @click="batchJoinWithProtocols">开始批量加入</button>
+              <div class="result-box small">{{ protocolJoinResult || '这里会显示批量加群执行结果' }}</div>
+            </div>
+          </section>
+        </div>
+
+        <section class="card">
+          <div class="card-head"><h2>验证结果</h2></div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>状态</th>
+                  <th>详情</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in protocolValidationResults" :key="item.account">
+                  <td>{{ item.account }}</td>
+                  <td><span :class="statusClass(item.valid ? '可用' : '不可用')">{{ item.valid ? '可用' : '不可用' }}</span></td>
+                  <td>{{ translateText(item.detail || item.status || item.error || '-') }}</td>
+                </tr>
+                <tr v-if="!protocolValidationResults.length">
+                  <td colspan="3" class="empty-cell">还没有验证结果</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section v-show="ui.activePage === 'health'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>健康检查</h1>
+            <p>逐个检查账号可用性，并支持清理失效账号。</p>
+          </div>
+          <div class="row">
+            <button class="secondary-btn" :disabled="loading.checkAccounts" @click="checkAccounts">开始检查</button>
+            <button class="danger-btn" :disabled="loading.clearInvalidAccounts || loading.checkAccounts" @click="clearInvalidAccounts">
+              {{ loading.clearInvalidAccounts ? '执行中...' : `清理失效账号（${invalidAccountCount}）` }}
+            </button>
+            <button class="danger-btn" :disabled="loading.clearNoSendAccounts || loading.checkAccounts" @click="clearNoSendAccounts">
+              {{ loading.clearNoSendAccounts ? '执行中...' : `清理群内不可发账号（${cannotSendAccountCount}）` }}
+            </button>
+          </div>
+        </div>
+        <div class="context-grid compact">
+          <div class="context-card">
+            <span>已授权账号</span>
+            <strong>{{ authorizedProfiles.length || authorizedAccountCount }}</strong>
+          </div>
+          <div class="context-card">
+            <span>失效账号</span>
+            <strong>{{ invalidAccountCount }}</strong>
+          </div>
+          <div class="context-card">
+            <span>群内不可发</span>
+            <strong>{{ cannotSendAccountCount }}</strong>
+          </div>
+        </div>
+        <section class="card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>账号</th>
+                  <th>状态</th>
+                  <th>群内发言</th>
+                  <th>详情</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in accountCheckResults" :key="row.account">
+                  <td>{{ row.account }}</td>
+                  <td><span :class="statusClass(row.status || '未检查')">{{ row.status || '未检查' }}</span></td>
+                  <td><span :class="statusClass(row.status === '检查中' ? '检查中' : (row.can_send_in_groups === false ? '不可发' : (row.can_send_in_groups === true ? '可发送' : '未检查')))">{{ row.status === '检查中' ? '检查中' : (row.can_send_in_groups === false ? '不可发' : (row.can_send_in_groups === true ? '可发送' : '-')) }}</span></td>
+                  <td>{{ row.detail || row.phone || '-' }}</td>
+                  <td>
+                    <button v-if="row.status === '失效账号'" class="tiny-btn danger" @click="deleteAuthorizedAccount(row.account)">删除</button>
+                  </td>
+                </tr>
+                <tr v-if="!accountCheckResults.length">
+                  <td colspan="5" class="empty-cell">还没有检查结果</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section v-show="ui.activePage === 'system'" class="page">
+        <div class="page-head">
+          <div>
+            <h1>系统设置</h1>
+            <p>系统重置、任务/日志清理、状态同步。</p>
+          </div>
+        </div>
+        <section class="card">
+          <div class="form-grid">
+            <label class="checkbox-line">
+              <input type="checkbox" name="reset_sessions" v-model="resetSessions" />
+              <span>重置时同时删除所有授权账号 Session</span>
+            </label>
+            <div class="row wrap">
+              <button class="danger-btn" @click="resetSystem">重置系统</button>
+              <button class="secondary-btn" @click="fetchDashboard(true)">同步全部状态</button>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+  {% endraw %}
+
+  <script src="/static/vue-admin.js?v=1.4.9"></script>
+</body>
+</html>

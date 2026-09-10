@@ -1,9 +1,8 @@
 from starlette.responses import JSONResponse
 from starlette.requests import Request
-from starlette.exceptions import HTTPException
 from app.config import CONFIG
 from app.database import SessionLocal
-from app.models import Task, SendLog, TaskEvent, GroupCache, AccountHealth
+from app.models import Task, SendLog, TaskEvent, GroupCache, AccountHealth, AccountProxy
 import os
 
 async def reset_system(request: Request):
@@ -26,6 +25,7 @@ async def reset_system(request: Request):
         db.query(Task).delete()
         db.query(GroupCache).delete()
         db.query(AccountHealth).delete()
+        db.query(AccountProxy).delete()
         
         db.commit()
         deleted_sessions = 0

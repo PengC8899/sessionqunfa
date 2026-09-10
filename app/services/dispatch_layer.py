@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple
 from sqlalchemy.orm import Session
 from app.models import SendLog
 from app.config import CONFIG
+from app.telegram_client import _extract_forward_source, _extract_inline_bot_query
 
 def _recent_group_stats(db: Session, account: str, group_id: int, window: int) -> Tuple[int, int, int]:
     rows = (
@@ -107,6 +108,8 @@ def dynamic_delay_ms(base_ms: int, recent_fail_rate: float) -> int:
 def randomize_message(text: str) -> str:
     if int(getattr(CONFIG, "CONTENT_FINGERPRINT_ENABLED", 1)) == 0:
         return text
+    if _extract_inline_bot_query(text)[0] or _extract_forward_source(text)[0] is not None:
+        return text
     t = text
     
     # 1. 基础替换
@@ -174,6 +177,38 @@ def _latest_group_activity_map(db: Session, group_ids: List[int]) -> Dict[int, d
     return latest
 
 
+def _group_outcome_score_map(rows) -> Dict[int, int]:
+    scores: Dict[int, int] = {}
+    for row in rows:
+        try:
+            gid = int(row.group_id)
+        except Exception:
+            continue
+        status = (row.status or "").lower()
+        if status == "success":
+            scores[gid] = scores.get(gid, 0) + 2
+        elif status == "failed":
+            scores[gid] = scores.get(gid, 0) - 1
+    return scores
+
+
+def _self_check_group_outcome_scores() -> None:
+    class _Row:
+        def __init__(self, group_id, status):
+            self.group_id = group_id
+            self.status = status
+
+    scores = _group_outcome_score_map([
+        _Row(1, "success"),
+        _Row(1, "failed"),
+        _Row(2, "failed"),
+    ])
+    assert scores[1] > scores[2]
+
+
+_self_check_group_outcome_scores()
+
+
 def filter_groups_by_global_cooldown(db: Session, group_ids: List[int], cooldown_s: int) -> List[int]:
     ids = unique_group_ids(group_ids)
     if cooldown_s <= 0 or not ids:
@@ -204,17 +239,41 @@ def sort_groups_for_account(db: Session, account: str, group_ids: List[int]) -> 
         .order_by(SendLog.created_at.desc())
         .all()
     )
+    global_rows = (
+        db.query(SendLog)
+        .filter(SendLog.group_id.in_(ids))
+        .order_by(SendLog.created_at.desc())
+        .limit(max(len(ids) * 8, 200))
+        .all()
+    )
     account_latest: Dict[int, datetime] = {}
     for row in account_rows:
         gid = int(row.group_id)
         if gid not in account_latest and row.created_at is not None:
             account_latest[gid] = row.created_at
+    account_scores = _group_outcome_score_map(account_rows)
     global_latest = _latest_group_activity_map(db, ids)
+    global_scores = _group_outcome_score_map(global_rows)
     rng = random.Random(f"{account}:{len(ids)}")
     jitter = {gid: rng.random() for gid in ids}
+
+    def tier(gid: int) -> int:
+        account_score = account_scores.get(gid, 0)
+        global_score = global_scores.get(gid, 0)
+        if account_score > 0:
+            return 0
+        if global_score > 0:
+            return 1
+        if account_score < 0 or global_score < 0:
+            return 3
+        return 2
+
     return sorted(
         ids,
         key=lambda gid: (
+            tier(gid),
+            -account_scores.get(gid, 0),
+            -global_scores.get(gid, 0),
             account_latest.get(gid) is not None,
             account_latest.get(gid) or datetime.min,
             global_latest.get(gid) is not None,

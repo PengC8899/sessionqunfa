@@ -15,7 +15,7 @@
 ## 技术架构
 
 - 后端：`Starlette`/`FastAPI 风格` 路由（入口 `main.py`），`Telethon` 负责 Telegram 交互
-- 前端：原生 HTML + JS（`templates/index.html`、`static/app.js`、`static/style.css`）
+- 前端：Vue 3 管理面板（`templates/vue_index.html`、`static/vue-admin.js`、`static/vue-admin.css`）
 - 数据库：`SQLAlchemy` + SQLite（默认 `sqlite:///./data.db`），模型 `SendLog`
 - 会话：Telethon `.session` 文件位于 `SESSION_DIR`
 - 容器化：`Dockerfile` + `docker-compose.yml`；可选 `Caddyfile` 进行反向代理
@@ -26,7 +26,7 @@
 - `app/telegram_client.py`：Telegram 客户端与多账号管理
 - `app/services/*.py`：群列表与发送逻辑
 - `app/models.py`、`app/database.py`：数据库模型与连接
-- `templates/index.html`、`static/*`：前端页面与交互脚本
+- `templates/vue_index.html`、`static/vue-admin.*`：当前管理面板页面与交互脚本
 - `Dockerfile`、`docker-compose.yml`、`Caddyfile`：容器与反向代理
 
 ## 快速开始（本地运行）
@@ -158,13 +158,14 @@ docker logs -f tg-bulk-caddy
 ## 使用指南（面板）
 
 - 输入并保存管理员令牌（顶部“管理员令牌”）
-- 选择账号（下拉“账号”），必要时完成登录（验证码与二次密码）
-- 点击“刷新群列表”，勾选需要发送的群/频道；可搜索、全选/取消
-- 编辑消息：选择解析模式 `plain/markdown/html`，是否关闭链接预览，设置每条间隔 `delay_ms`
+- 选择账号（顶部下拉“账号”），必要时完成登录（验证码与二次密码）
+- 左侧“群组快选”中勾选需要发送的群组；支持搜索、全选/清空、刷新
+- 在“邀请任务”页编辑消息：选择解析模式 `plain/markdown/html`，设置间隔、轮数、轮次间隔，按需关闭链接预览
 - 发送：
-  - “发送到选中群组”采用异步任务（可在页面底部实时查看进度）
-  - “发送测试消息”立即返回结果，不加入异步队列
-- 日志：底部“最近日志”显示发送时间、目标、状态与错误信息
+  - “发送到选中群组”创建单账号异步任务
+  - “已授权账号批量群发”按当前可用账号批量创建任务
+  - “测试发送”立即返回结果，不加入异步队列
+- 总览页可查看任务摘要、最近日志；健康检查页可逐账号检查可用性与群内发言能力
 
 ## API 文档（需 Header：`X-Admin-Token: <ADMIN_TOKEN>`）
 

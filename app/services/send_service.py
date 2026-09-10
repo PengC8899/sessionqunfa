@@ -8,7 +8,7 @@ from app.telegram_client import MultiTelegramManager
 from app.models import SendLog, Task, TaskEvent
 from app.config import CONFIG
 from app.services.send_scheduler import SendScheduler
-from app.services.group_service import get_banned_group_ids, add_banned_group, should_exclude_group_on_error
+from app.services.group_service import get_banned_group_ids, add_banned_group, should_exclude_group_on_error, should_add_to_global_blist
 
 
 _SEND_CACHE: dict[str, float] = {}
@@ -82,12 +82,7 @@ async def send_to_groups(
                 err = "account_paused"
                 msg_id = None
                 preview = message[:200]
-                title = str(gid)
-                try:
-                    ent = await manager.get(account).client.get_entity(gid)
-                    title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
-                except Exception:
-                    title = str(gid)
+                title = await manager.get_group_title(account, gid)
                 db.add(
                     SendLog(
                         account_name=account,
@@ -142,7 +137,7 @@ async def send_to_groups(
             if not ok and err:
                 if should_exclude_group_on_error(err):
                     try:
-                        add_banned_group(db, account, gid)
+                        add_banned_group(db, account, gid, global_scope=should_add_to_global_blist(err))
                     except Exception:
                         pass
             if status == "success":
@@ -150,12 +145,7 @@ async def send_to_groups(
             elif status == "failed":
                 failed += 1
         preview = message[:200]
-        title = str(gid)
-        try:
-            ent = await manager.get(account).client.get_entity(gid)
-            title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
-        except Exception:
-            title = str(gid)
+        title = await manager.get_group_title(account, gid)
         db.add(
             SendLog(
                 account_name=account,

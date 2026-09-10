@@ -9,6 +9,54 @@ import time
 _GROUP_CACHE: dict[tuple[str, bool], dict] = {}
 _CACHE_TTL_SECONDS = getattr(CONFIG, "GROUP_CACHE_TTL_SECONDS", 600)
 
+_PERMANENT_ERROR_MARKERS = (
+    "banned from sending messages",
+    "user_banned_in_channel",
+    "chat_write_forbidden",
+    "chat_send_plain_forbidden",
+    "chat_send_media_forbidden",
+    "chat_send_photos_forbidden",
+    "chat_send_videos_forbidden",
+    "chat_send_roundvideos_forbidden",
+    "chat_send_docs_forbidden",
+    "chat_send_gifs_forbidden",
+    "chat_send_stickers_forbidden",
+    "chat_send_voices_forbidden",
+    "chat_send_audios_forbidden",
+    "chat_send_polls_forbidden",
+    "you cannot send inline results in this chat",
+    "peer error",
+    "invalid peer",
+    "could not find the input entity",
+    "peer_is_user",
+    "the chat is restricted and cannot be used in that request",
+    "chat restricted",
+    "channel_private",
+    "session database corrupted",
+    "not authorized",
+)
+
+_GLOBAL_ERROR_MARKERS = (
+    "could not find the input entity",
+    "invalid peer",
+    "peer error",
+    "channel_private",
+    "the chat is restricted and cannot be used in that request",
+    "chat restricted",
+)
+
+_TEMPORARY_ERROR_MARKERS = (
+    "floodwait",
+    "a wait of",
+    "seconds is required",
+    "too many requests",
+    "retry after",
+    "timeout",
+    "network error",
+    "connection reset",
+    "connection refused",
+)
+
 def _normalize_group_items(data: list[dict]) -> list[dict]:
     normalized: list[dict] = []
     for item in data or []:
@@ -33,212 +81,66 @@ def should_exclude_group_on_error(error_text: str | None) -> bool:
     if not error_text:
         return False
     err = str(error_text).lower()
-    markers = (
-        "banned from sending messages",
-        "user_banned_in_channel",
-        "chat_write_forbidden",
-        "chat_send_plain_forbidden",
-        "chat_send_media_forbidden",
-        "peer error",
-        "invalid peer",
-        "could not find the input entity",
-        "peer_is_user",
-        "the chat is restricted and cannot be used in that request",
-        "chat restricted",
-    )
-    if any(marker in err for marker in markers):
-        return True
-    return False
-
-
-
+    return any(marker in err for marker in _PERMANENT_ERROR_MARKERS)
 
 def classify_error_type(error_text: str | None) -> str:
     """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
     if not error_text:
         return "unknown"
-    
+
     err = str(error_text).lower()
-    
-    # 永久错误 - 应该拉黑
-    permanent_markers = (
-        "banned from sending messages",
-        "user_banned_in_channel",
-        "chat_write_forbidden",
-        "chat_send_plain_forbidden",
-        "chat_send_media_forbidden",
-        "peer error",
-        "invalid peer",
-        "could not find the input entity",
-        "peer_is_user",
-        "the chat is restricted and cannot be used in that request",
-        "chat restricted",
-        "channel_private",
-        "session database corrupted",
-        "not authorized",
-    )
-    
-    # 临时错误 - 不应该拉黑
-    temporary_markers = (
-        "floodwait",
-        "a wait of",
-        "seconds is required",
-        "too many requests",
-        "retry after",
-        "timeout",
-        "network error",
-        "connection reset",
-        "connection refused",
-    )
-    
-    if any(marker in err for marker in permanent_markers):
+    if any(marker in err for marker in _PERMANENT_ERROR_MARKERS):
         return "permanent"
-    elif any(marker in err for marker in temporary_markers):
+    if any(marker in err for marker in _TEMPORARY_ERROR_MARKERS):
         return "temporary"
-    else:
-        return "unknown"
+    return "unknown"
 
 
 def should_add_to_blist(error_text: str | None) -> bool:
-    """判断是否应该将群组加入黑名单"""
-    error_type = classify_error_type(error_text)
-    # 只有永久错误才加入黑名单
-    return error_type == "permanent"
+    return classify_error_type(error_text) == "permanent"
 
 
-def classify_error_type(error_text: str | None) -> str:
-    """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
+def should_add_to_global_blist(error_text: str | None) -> bool:
     if not error_text:
-        return "unknown"
-    
+        return False
     err = str(error_text).lower()
-    
-    # 永久错误 - 应该拉黑
-    permanent_markers = (
-        "banned from sending messages",
-        "user_banned_in_channel",
-        "chat_write_forbidden",
-        "chat_send_plain_forbidden",
-        "chat_send_media_forbidden",
-        "peer error",
-        "invalid peer",
-        "could not find the input entity",
-        "peer_is_user",
-        "the chat is restricted and cannot be used in that request",
-        "chat restricted",
-        "channel_private",
-        "session database corrupted",
-        "not authorized",
-    )
-    
-    # 临时错误 - 不应该拉黑
-    temporary_markers = (
-        "floodwait",
-        "a wait of",
-        "seconds is required",
-        "too many requests",
-        "retry after",
-        "timeout",
-        "network error",
-        "connection reset",
-        "connection refused",
-    )
-    
-    if any(marker in err for marker in permanent_markers):
-        return "permanent"
-    elif any(marker in err for marker in temporary_markers):
-        return "temporary"
-    else:
-        return "unknown"
-
-
-def should_add_to_blist(error_text: str | None) -> bool:
-    """判断是否应该将群组加入黑名单"""
-    error_type = classify_error_type(error_text)
-    # 只有永久错误才加入黑名单
-    return error_type == "permanent"
-
-
-def classify_error_type(error_text: str | None) -> str:
-    """分类错误类型：permanent(永久), temporary(临时), unknown(未知)"""
-    if not error_text:
-        return "unknown"
-    
-    err = str(error_text).lower()
-    
-    # 永久错误 - 应该拉黑
-    permanent_markers = (
-        "banned from sending messages",
-        "user_banned_in_channel",
-        "chat_write_forbidden",
-        "chat_send_plain_forbidden",
-        "chat_send_media_forbidden",
-        "peer error",
-        "invalid peer",
-        "could not find the input entity",
-        "peer_is_user",
-        "the chat is restricted and cannot be used in that request",
-        "chat restricted",
-        "channel_private",
-        "session database corrupted",
-        "not authorized",
-    )
-    
-    # 临时错误 - 不应该拉黑
-    temporary_markers = (
-        "floodwait",
-        "a wait of",
-        "seconds is required",
-        "too many requests",
-        "retry after",
-        "timeout",
-        "network error",
-        "connection reset",
-        "connection refused",
-    )
-    
-    if any(marker in err for marker in permanent_markers):
-        return "permanent"
-    elif any(marker in err for marker in temporary_markers):
-        return "temporary"
-    else:
-        return "unknown"
-
-
-def should_add_to_blist(error_text: str | None) -> bool:
-    """判断是否应该将群组加入黑名单"""
-    error_type = classify_error_type(error_text)
-    # 只有永久错误才加入黑名单
-    return error_type == "permanent"
+    return any(marker in err for marker in _GLOBAL_ERROR_MARKERS)
 
 def get_banned_group_ids(db: Session, account: Optional[str] = None) -> list[int]:
-    if not account:
-        return []
-    row = db.query(SystemKV).filter(SystemKV.k == f"banned_groups:{account}").first()
-    if not row or not (row.v or "").strip():
-        return []
-    try:
-        data = json.loads(row.v)
-        if isinstance(data, list):
-            return [int(x) for x in data if isinstance(x, (int, str)) and str(x).lstrip("-").isdigit()]
-    except Exception:
-        return []
-    return []
+    keys = ["banned_groups:global"]
+    if account:
+        keys.append(f"banned_groups:{account}")
+    collected: set[int] = set()
+    for key in keys:
+        row = db.query(SystemKV).filter(SystemKV.k == key).first()
+        if not row or not (row.v or "").strip():
+            continue
+        try:
+            data = json.loads(row.v)
+            if isinstance(data, list):
+                for item in data:
+                    text = str(item)
+                    if text.lstrip("-").isdigit():
+                        collected.add(int(text))
+        except Exception:
+            continue
+    return sorted(collected)
 
-def add_banned_group(db: Session, account: str, gid: int):
-    gids = set(get_banned_group_ids(db, account))
+def add_banned_group(db: Session, account: str, gid: int, global_scope: bool = False):
+    key = "banned_groups:global" if global_scope else f"banned_groups:{account}"
+    gids = set(get_banned_group_ids(db, None if global_scope else account))
     gids.add(int(gid))
     payload = json.dumps(sorted(gids), ensure_ascii=False)
-    row = db.query(SystemKV).filter(SystemKV.k == f"banned_groups:{account}").first()
+    row = db.query(SystemKV).filter(SystemKV.k == key).first()
     if row:
         row.v = payload
     else:
-        row = SystemKV(k=f"banned_groups:{account}", v=payload)
+        row = SystemKV(k=key, v=payload)
         db.add(row)
     db.commit()
     for k in list(_GROUP_CACHE.keys()):
         acc, og = k
-        if acc == account:
+        if global_scope or acc == account:
             _GROUP_CACHE[k]["ts"] = 0.0
 
 async def get_groups(manager: MultiTelegramManager, account: str, only_groups: bool = True, refresh: bool = False, db: Session | None = None):

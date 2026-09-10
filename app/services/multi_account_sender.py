@@ -311,12 +311,7 @@ class MultiAccountSender:
                     )
                     
                     # 获取群组标题 (不需要锁,这是 Telegram API 调用)
-                    title = str(gid)
-                    try:
-                        ent = await self.manager.get(account).client.get_entity(gid)
-                        title = getattr(ent, 'title', None) or str(gid)
-                    except:
-                        pass
+                    title = await self.manager.get_group_title(account, gid)
                     
                     # 数据库操作 (需要锁保护)
                     async with db_lock:

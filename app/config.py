@@ -21,6 +21,21 @@ class Settings:
     GROUP_CACHE_TTL_SECONDS: int
     GROUP_CACHE_ENABLED: int
     TIMEZONE: str
+    TASK_STUCK_TIMEOUT_S: int
+    TASK_CLEANUP_INTERVAL_S: int
+    TASK_HEARTBEAT_INTERVAL_S: int
+    TASK_RUNNER_MISSING_TIMEOUT_S: int
+    CONNECTION_CLEANUP_INTERVAL_S: int
+    TELEGRAM_MAX_CONCURRENT_CONNECTIONS: int
+    TELEGRAM_IDLE_TIMEOUT_S: int
+    SQLITE_BUSY_TIMEOUT_MS: int
+    SQLITE_HEALTHCHECK_INTERVAL_S: int
+    DB_POOL_SIZE: int
+    DB_MAX_OVERFLOW: int
+    DB_POOL_TIMEOUT_S: int
+    DB_POOL_RECYCLE_S: int
+    STARTUP_RESUME_MIN_DELAY_S: int
+    STARTUP_RESUME_MAX_DELAY_S: int
     # 多账号并发配置
     MULTI_ACCOUNT_ENABLED: int
     MULTI_ACCOUNT_MAX_CONCURRENT: int
@@ -74,13 +89,28 @@ class Settings:
         self.SESSION_DIR = os.getenv("SESSION_DIR", ".")
         self.SEND_RETRY_MAX = int(os.getenv("SEND_RETRY_MAX", "2"))
         self.SEND_RETRY_DELAY_MS = int(os.getenv("SEND_RETRY_DELAY_MS", "1500"))
-        self.SEND_MIN_DELAY_MS = int(os.getenv("SEND_MIN_DELAY_MS", "11000"))
+        self.SEND_MIN_DELAY_MS = int(os.getenv("SEND_MIN_DELAY_MS", "3000"))
         try:
             self.SEND_JITTER_PCT = float(os.getenv("SEND_JITTER_PCT", "0.15"))
         except Exception:
             self.SEND_JITTER_PCT = 0.15
         self.GROUP_CACHE_TTL_SECONDS = int(os.getenv("GROUP_CACHE_TTL_SECONDS", "600"))
         self.GROUP_CACHE_ENABLED = int(os.getenv("GROUP_CACHE_ENABLED", "1"))
+        self.TASK_STUCK_TIMEOUT_S = int(os.getenv("TASK_STUCK_TIMEOUT_S", "1800"))
+        self.TASK_CLEANUP_INTERVAL_S = int(os.getenv("TASK_CLEANUP_INTERVAL_S", "60"))
+        self.TASK_HEARTBEAT_INTERVAL_S = int(os.getenv("TASK_HEARTBEAT_INTERVAL_S", "20"))
+        self.TASK_RUNNER_MISSING_TIMEOUT_S = int(os.getenv("TASK_RUNNER_MISSING_TIMEOUT_S", "120"))
+        self.CONNECTION_CLEANUP_INTERVAL_S = int(os.getenv("CONNECTION_CLEANUP_INTERVAL_S", "60"))
+        self.TELEGRAM_MAX_CONCURRENT_CONNECTIONS = int(os.getenv("TELEGRAM_MAX_CONCURRENT_CONNECTIONS", "5"))
+        self.TELEGRAM_IDLE_TIMEOUT_S = int(os.getenv("TELEGRAM_IDLE_TIMEOUT_S", "300"))
+        self.SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "15000"))
+        self.SQLITE_HEALTHCHECK_INTERVAL_S = int(os.getenv("SQLITE_HEALTHCHECK_INTERVAL_S", "300"))
+        self.DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
+        self.DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "40"))
+        self.DB_POOL_TIMEOUT_S = int(os.getenv("DB_POOL_TIMEOUT_S", "60"))
+        self.DB_POOL_RECYCLE_S = int(os.getenv("DB_POOL_RECYCLE_S", "3600"))
+        self.STARTUP_RESUME_MIN_DELAY_S = int(os.getenv("STARTUP_RESUME_MIN_DELAY_S", "5"))
+        self.STARTUP_RESUME_MAX_DELAY_S = int(os.getenv("STARTUP_RESUME_MAX_DELAY_S", "45"))
         try:
             self.ACCOUNT_COUNT = int(os.getenv("ACCOUNT_COUNT", "20"))
         except Exception:
@@ -95,7 +125,7 @@ class Settings:
         self.MULTI_ACCOUNT_MAX_CONCURRENT = int(os.getenv("MULTI_ACCOUNT_MAX_CONCURRENT", "3"))
         # 账号之间的发送间隔 (ms)，防止风控
         self.MULTI_ACCOUNT_STAGGER_MS = int(os.getenv("MULTI_ACCOUNT_STAGGER_MS", "5000"))
-        self.RESUME_TASKS_ON_STARTUP = int(os.getenv("RESUME_TASKS_ON_STARTUP", "0"))
+        self.RESUME_TASKS_ON_STARTUP = int(os.getenv("RESUME_TASKS_ON_STARTUP", "1"))
         self.SCHEDULER_ENABLED = int(os.getenv("SCHEDULER_ENABLED", "1"))
         self.GROUP_RECENT_WINDOW = int(os.getenv("GROUP_RECENT_WINDOW", "50"))
         try:

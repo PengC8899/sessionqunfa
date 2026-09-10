@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import List, Optional
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
@@ -15,10 +16,30 @@ import tempfile
 import shutil
 import random
 import hashlib
+import socks
+
+from app.database import SessionLocal
+from app.services.proxy_service import get_proxy_binding
 
 COPY_RECEIVER_ACCOUNT = None
 COPY_RECEIVER_ENABLED = 0
 _ON_PRIVATE_MESSAGE = None
+
+
+def _should_retry_with_reconnect(error_text: str | None) -> bool:
+    err = (error_text or "").lower()
+    transient_markers = (
+        "cannot send requests while disconnected",
+        "connection",
+        "timed out",
+        "timeout",
+        "broken pipe",
+        "server closed the connection",
+        "network",
+        "transport",
+        "reset by peer",
+    )
+    return any(marker in err for marker in transient_markers)
 
 def _generate_device_info(session_name: str):
     """
@@ -59,6 +80,71 @@ def set_on_private_message(cb):
     global _ON_PRIVATE_MESSAGE
     _ON_PRIVATE_MESSAGE = cb
 
+
+def _looks_like_postbot_code(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw or " " in raw or len(raw) < 10 or len(raw) > 128:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return False
+    return bool(re.search(r"\d", raw))
+
+
+def _extract_inline_bot_query(text: str) -> tuple[Optional[str], Optional[str]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    inline_match = re.match(r"^@([A-Za-z0-9_]{5,32})\s+(.+)$", raw)
+    if inline_match:
+        bot_username = inline_match.group(1)
+        query = inline_match.group(2).strip()
+        return (bot_username, query) if query else (None, None)
+
+    prefix_match = re.match(r"^(postbot)\s*[:\s]\s*(.+)$", raw, flags=re.IGNORECASE)
+    if prefix_match:
+        query = prefix_match.group(2).strip()
+        return (INLINE_BOT_USERNAME, query) if query else (None, None)
+
+    deep_link_match = re.search(
+        r"(?:https?://)?t\.me/(PostBot)(?:/)?\?start=([A-Za-z0-9_-]{6,128})",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if deep_link_match:
+        return deep_link_match.group(1), deep_link_match.group(2)
+
+    if _looks_like_postbot_code(raw):
+        return INLINE_BOT_USERNAME, raw
+
+    return None, None
+
+
+def _extract_forward_source(text: str) -> tuple[Optional[object], Optional[int]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    private_match = re.match(
+        r"^(?:https?://)?t\.me/c/(\d+)/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if private_match:
+        internal_id = private_match.group(1)
+        message_id = int(private_match.group(2))
+        return int(f"-100{internal_id}"), message_id
+
+    public_match = re.match(
+        r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{5,32})/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if public_match:
+        return public_match.group(1), int(public_match.group(2))
+
+    return None, None
+
 INLINE_BOT_USERNAME = "PostBot"
 INLINE_BOT_QUERY = "694014ffc3b8e"
 
@@ -92,6 +178,57 @@ class AccountClientManager:
         self._auto_reply_setup = False
         self._last_activity = 0  # 最后活动时间
         self._lock = asyncio.Lock()  # 连接锁
+        self._started_inline_bots: set[str] = set()
+        self._group_title_cache: dict[int, str] = {}
+
+    def _load_proxy(self):
+        with SessionLocal() as db:
+            binding = get_proxy_binding(db, self.session_name)
+            if not binding or not int(binding.enabled or 0):
+                return None
+            proxy_type = (binding.proxy_type or "socks5").strip().lower()
+            proxy_kind = socks.SOCKS5 if proxy_type == "socks5" else socks.HTTP
+            return (
+                proxy_kind,
+                binding.host,
+                int(binding.port),
+                True,
+                binding.username or None,
+                binding.password or None,
+            )
+
+    def _build_client(self, session_base: str, loop, use_device_fingerprint: bool = True):
+        kwargs = {
+            "loop": loop,
+            "proxy": self._load_proxy(),
+        }
+        if use_device_fingerprint:
+            device_params = _generate_device_info(self.session_name)
+            kwargs.update(
+                {
+                    "device_model": device_params["device_model"],
+                    "system_version": device_params["system_version"],
+                    "app_version": device_params["app_version"],
+                    "lang_code": device_params["lang_code"],
+                    "system_lang_code": device_params["system_lang_code"],
+                }
+            )
+        return TelegramClient(session_base, self.api_id, self.api_hash, **kwargs)
+
+    async def reset_client(self):
+        async with self._lock:
+            if self.client:
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+            self.client = None
+            self._connected = False
+            self._auto_reply_setup = False
+
+    async def reconnect(self):
+        await self.reset_client()
+        await self.ensure_connected()
 
     async def ensure_connected(self):
         async with self._lock:
@@ -99,19 +236,7 @@ class AccountClientManager:
                 loop = asyncio.get_running_loop()
                 if self.client is None:
                     session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-                    # 生成设备指纹
-                    device_params = _generate_device_info(self.session_name)
-                    self.client = TelegramClient(
-                        session_base, 
-                        self.api_id, 
-                        self.api_hash, 
-                        loop=loop,
-                        device_model=device_params["device_model"],
-                        system_version=device_params["system_version"],
-                        app_version=device_params["app_version"],
-                        lang_code=device_params["lang_code"],
-                        system_lang_code=device_params["system_lang_code"]
-                    )
+                    self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
                 if not self.client.is_connected():
                     try:
                         await self.client.connect()
@@ -206,7 +331,7 @@ F2F
         loop = asyncio.get_running_loop()
         if self.client is None:
             session_base = os.path.join(CONFIG.SESSION_DIR, self.session_name)
-            self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+            self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
         await self.client.connect()
         try:
             authorized = await self.client.is_user_authorized()
@@ -232,12 +357,7 @@ F2F
         
         # 1. 关闭现有连接
         if self.client:
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self.client = None
-            self._connected = False
+            await self.reset_client()
         
         # 2. 检查是否需要删除现有 session
         # 只有在明确要求或者 session 文件损坏时才删除
@@ -255,7 +375,7 @@ F2F
             # 尝试使用现有 session
             print(f"[DEBUG] Found existing session file, checking if authorized...")
             try:
-                temp_client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+                temp_client = self._build_client(session_base, loop, use_device_fingerprint=True)
                 await temp_client.connect()
                 if await temp_client.is_user_authorized():
                     await temp_client.disconnect()
@@ -273,7 +393,7 @@ F2F
                         print(f"[ERROR] Failed to delete {p}: {del_err}")
 
         # 3. 创建新客户端
-        self.client = TelegramClient(session_base, self.api_id, self.api_hash, loop=loop)
+        self.client = self._build_client(session_base, loop, use_device_fingerprint=True)
         await self.client.connect()
         
         try:
@@ -354,7 +474,7 @@ F2F
             if os.path.exists(journal_src):
                 shutil.copy2(journal_src, f"{temp_session_base}.session-journal")
 
-            temp_client = TelegramClient(temp_session_base, self.api_id, self.api_hash, loop=loop)
+            temp_client = self._build_client(temp_session_base, loop, use_device_fingerprint=False)
             await temp_client.connect()
             
             if not await temp_client.is_user_authorized():
@@ -437,6 +557,244 @@ F2F
                 })
         return result
 
+    async def inspect_group_send_capability(self) -> dict:
+        """检查账号是否至少能在一个已加入群里发送文字消息。"""
+        await self._ensure_client()
+        if not await self.client.is_user_authorized():
+            return {
+                "can_send_in_groups": False,
+                "sendable_groups": 0,
+                "checked_groups": 0,
+                "detail": "账号未授权",
+            }
+
+        await self.ensure_connected()
+        dialogs = await self.client.get_dialogs(limit=None)
+        me = await self.client.get_me()
+        checked_groups = 0
+        blocked_groups = 0
+        last_block_reason = None
+
+        for dialog in dialogs:
+            entity = dialog.entity
+            is_group = isinstance(entity, Chat) or (
+                isinstance(entity, Channel) and bool(getattr(entity, "megagroup", False))
+            )
+            if not is_group:
+                continue
+
+            checked_groups += 1
+            try:
+                permissions = await self.client.get_permissions(entity, me)
+                send_messages = getattr(permissions, "send_messages", None)
+                if send_messages is False:
+                    blocked_groups += 1
+                    last_block_reason = "chat_write_forbidden"
+                    continue
+                return {
+                    "can_send_in_groups": True,
+                    "sendable_groups": 1,
+                    "checked_groups": checked_groups,
+                    "group_id": int(get_peer_id(entity)),
+                    "group_title": getattr(entity, "title", None) or dialog.name,
+                    "detail": f"可在群 {getattr(entity, 'title', None) or dialog.name} 发消息",
+                }
+            except ChatWriteForbiddenError:
+                blocked_groups += 1
+                last_block_reason = "chat_write_forbidden"
+            except UserBannedInChannelError:
+                blocked_groups += 1
+                last_block_reason = "user_banned_in_channel"
+            except Exception as exc:
+                err_text = str(exc).lower()
+                if "chat_write_forbidden" in err_text or "banned from sending messages" in err_text:
+                    blocked_groups += 1
+                    last_block_reason = str(exc)[:80]
+                    continue
+                # 无法稳定读取权限时，不把账号直接判死，继续检查下一个群。
+                last_block_reason = str(exc)[:80]
+
+        if checked_groups == 0:
+            return {
+                "can_send_in_groups": False,
+                "sendable_groups": 0,
+                "checked_groups": 0,
+                "detail": "未加入任何可检测群组",
+            }
+
+        detail = f"已检查 {checked_groups} 个群，均无法发送消息"
+        if last_block_reason:
+            detail = f"{detail}（最近原因: {last_block_reason}）"
+        return {
+            "can_send_in_groups": False,
+            "sendable_groups": 0,
+            "checked_groups": checked_groups,
+            "blocked_groups": blocked_groups,
+            "detail": detail,
+        }
+
+    async def _resolve_entity_from_dialogs(self, target_group_id: int):
+        dialogs = await self.client.get_dialogs(limit=None)
+        for d in dialogs:
+            e = d.entity
+            try:
+                if int(get_peer_id(e)) == int(target_group_id):
+                    return e
+            except Exception:
+                pass
+            try:
+                if int(getattr(e, "id", 0)) == int(target_group_id):
+                    return e
+            except Exception:
+                pass
+        raise ValueError("entity_not_found_in_dialogs")
+
+    async def _resolve_group_entity(self, group_id: int):
+        try:
+            ent = await self.client.get_entity(group_id)
+        except Exception as e:
+            try:
+                ent = await self._resolve_entity_from_dialogs(group_id)
+            except Exception:
+                raise e
+        return ent
+
+    async def get_group_title(self, group_id: int) -> str:
+        gid = int(group_id)
+        cached = self._group_title_cache.get(gid)
+        if cached:
+            return cached
+        try:
+            await self.ensure_connected()
+            ent = await self._resolve_group_entity(gid)
+            title = getattr(ent, "title", None) or getattr(ent, "username", None) or getattr(ent, "first_name", None) or str(gid)
+        except Exception:
+            title = str(gid)
+        self._group_title_cache[gid] = title
+        return title
+
+    async def ensure_inline_bot_ready(self, bot_username: str) -> None:
+        await self.ensure_connected()
+        normalized = (bot_username or "").lstrip("@").strip()
+        if not normalized:
+            return
+        cache_key = normalized.lower()
+        if cache_key in self._started_inline_bots:
+            return
+
+        try:
+            dialogs = await self.client.get_dialogs(limit=200)
+            for dialog in dialogs:
+                username = getattr(dialog.entity, "username", None)
+                if username and username.lower() == cache_key:
+                    self._started_inline_bots.add(cache_key)
+                    return
+        except Exception:
+            pass
+
+        try:
+            bot_entity = await self.client.get_entity(normalized)
+            await self.client.send_message(bot_entity, "/start")
+        except Exception as e:
+            # 不阻断后续 inline 查询；有些账号已经 start 过，或者 bot 侧会拒绝重复 start。
+            print(f"[WARN] Failed to warm up inline bot @{normalized} for {self.session_name}: {e}")
+        finally:
+            self._started_inline_bots.add(cache_key)
+
+    async def _resolve_source_entity(self, source_peer: object):
+        if isinstance(source_peer, str):
+            return await self.client.get_entity(source_peer)
+        if isinstance(source_peer, int):
+            return await self._resolve_group_entity(source_peer)
+        raise ValueError("unsupported_source_peer")
+
+    async def ensure_forward_source_ready(self, source_peer: object) -> object:
+        await self.ensure_connected()
+        entity = await self._resolve_source_entity(source_peer)
+        if isinstance(entity, Channel):
+            try:
+                from telethon.tl.functions.channels import JoinChannelRequest
+                await self.client(JoinChannelRequest(entity))
+            except Exception:
+                # 已加入、私有频道或不允许加入都不在这里阻断；
+                # 真实可用性由后续 get_messages/forward_messages 决定。
+                pass
+        return entity
+
+    async def forward_message_link_to_group(
+        self,
+        group_id: int,
+        source_peer: object,
+        source_message_id: int,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        await self.ensure_connected()
+
+        try:
+            target_ent = await self._resolve_group_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(target_ent, User):
+            return False, "peer_is_user", None
+
+        try:
+            source_ent = await self.ensure_forward_source_ready(source_peer)
+        except Exception as e:
+            return False, f"forward_source_unavailable: {e}", None
+
+        try:
+            src_msg = await self.client.get_messages(source_ent, ids=source_message_id)
+            if not src_msg:
+                return False, "forward_source_message_not_found", None
+        except Exception as e:
+            return False, f"forward_source_fetch_failed: {e}", None
+
+        try:
+            forwarded = await self.client.forward_messages(
+                entity=target_ent,
+                messages=[source_message_id],
+                from_peer=source_ent,
+            )
+            if isinstance(forwarded, list):
+                forwarded = forwarded[0] if forwarded else None
+            mid = getattr(forwarded, "id", None) if forwarded else None
+            return True, None, mid
+        except ChatWriteForbiddenError:
+            return False, "chat_write_forbidden", None
+        except UserBannedInChannelError:
+            return False, "user_banned_in_channel", None
+        except Exception as e:
+            return False, f"forward_send_failed: {e}", None
+
+    async def send_inline_message_to_group(
+        self,
+        group_id: int,
+        query: str,
+        bot_username: str = INLINE_BOT_USERNAME,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        await self.ensure_connected()
+
+        try:
+            ent = await self._resolve_group_entity(group_id)
+        except Exception as e:
+            return False, str(e), None
+        if isinstance(ent, User):
+            return False, "peer_is_user", None
+
+        try:
+            await self.ensure_inline_bot_ready(bot_username)
+            results = await self.client.inline_query(bot_username, query, entity=ent)
+            if not results:
+                return False, "inline_no_results", None
+            msg = await results[0].click(entity=ent, hide_via=True)
+            mid = getattr(msg, "id", None)
+            return True, None, mid
+        except ChatWriteForbiddenError:
+            return False, "chat_write_forbidden", None
+        except UserBannedInChannelError:
+            return False, "user_banned_in_channel", None
+        except Exception as e:
+            return False, f"inline_send_failed: {e}", None
+
     async def send_message_to_group(
         self,
         group_id: int,
@@ -446,29 +804,26 @@ F2F
     ) -> tuple[bool, Optional[str], Optional[int]]:
         await self.ensure_connected()
 
-        async def _resolve_entity_from_dialogs(target_group_id: int):
-            dialogs = await self.client.get_dialogs(limit=None)
-            for d in dialogs:
-                e = d.entity
-                try:
-                    if int(get_peer_id(e)) == int(target_group_id):
-                        return e
-                except Exception:
-                    pass
-                try:
-                    if int(getattr(e, "id", 0)) == int(target_group_id):
-                        return e
-                except Exception:
-                    pass
-            raise ValueError("entity_not_found_in_dialogs")
+        source_peer, source_message_id = _extract_forward_source(text)
+        if source_peer is not None and source_message_id is not None:
+            return await self.forward_message_link_to_group(
+                group_id=group_id,
+                source_peer=source_peer,
+                source_message_id=source_message_id,
+            )
+
+        bot_username, inline_query = _extract_inline_bot_query(text)
+        if bot_username and inline_query:
+            return await self.send_inline_message_to_group(
+                group_id=group_id,
+                query=inline_query,
+                bot_username=bot_username,
+            )
 
         try:
-            ent = await self.client.get_entity(group_id)
+            ent = await self._resolve_group_entity(group_id)
         except Exception as e:
-            try:
-                ent = await _resolve_entity_from_dialogs(group_id)
-            except Exception:
-                return False, str(e), None
+            return False, str(e), None
         if isinstance(ent, User):
             return False, "peer_is_user", None
         pm = None
@@ -493,6 +848,17 @@ F2F
         except UserBannedInChannelError:
             return False, "user_banned_in_channel", None
         except Exception as e:
+            if _should_retry_with_reconnect(str(e)):
+                try:
+                    print(f"[WARN] Connection issue on {self.session_name}, reconnecting before retry: {e}")
+                    await self.reconnect()
+                    ent = await self._resolve_group_entity(group_id)
+                    msg = await _do_send(ent)
+                    mid = getattr(msg, 'id', None)
+                    return True, None, mid
+                except Exception as retry_err:
+                    return False, f"reconnect_retry_failed: {retry_err}", None
+
             # Handle "Invalid Peer" or "Could not find input entity"
             # This happens when the entity is not in the local cache/session file
             err_str = str(e).lower()
@@ -503,7 +869,7 @@ F2F
                     try:
                         entity = await self.client.get_entity(group_id)
                     except Exception:
-                        entity = await _resolve_entity_from_dialogs(group_id)
+                        entity = await self._resolve_entity_from_dialogs(group_id)
                     msg = await _do_send(entity)
                     mid = getattr(msg, 'id', None)
                     return True, None, mid
@@ -515,7 +881,7 @@ F2F
                         try:
                             entity = await self.client.get_entity(group_id)
                         except Exception:
-                            entity = await _resolve_entity_from_dialogs(group_id)
+                            entity = await self._resolve_entity_from_dialogs(group_id)
                         msg = await _do_send(entity)
                         mid = getattr(msg, 'id', None)
                         return True, None, mid
@@ -777,10 +1143,9 @@ F2F
 
 
 class MultiTelegramManager:
-    MAX_CONCURRENT_CONNECTIONS = 5  # 最大同时连接数
-    IDLE_TIMEOUT = 300  # 5 分钟空闲后断开
-    
     def __init__(self, accounts: dict):
+        self.MAX_CONCURRENT_CONNECTIONS = max(int(getattr(CONFIG, "TELEGRAM_MAX_CONCURRENT_CONNECTIONS", 5)), 1)
+        self.IDLE_TIMEOUT = max(int(getattr(CONFIG, "TELEGRAM_IDLE_TIMEOUT_S", 300)), 30)
         self.managers: dict[str, AccountClientManager] = {}
         for name, cfg in accounts.items():
             self.managers[name] = AccountClientManager(cfg["session_name"], cfg["api_id"], cfg["api_hash"])
@@ -837,6 +1202,9 @@ class MultiTelegramManager:
     async def get_joined_groups(self, account: str, only_groups: bool = True) -> List[dict]:
         return await self.get(account).get_joined_groups(only_groups=only_groups)
 
+    async def inspect_group_send_capability(self, account: str) -> dict:
+        return await self.get(account).inspect_group_send_capability()
+
     async def send_message_to_group(self, account: str, *args, **kwargs):
         return await self.get(account).send_message_to_group(*args, **kwargs)
 
@@ -863,8 +1231,14 @@ class MultiTelegramManager:
     async def get_profile(self, account: str) -> dict:
         return await self.get(account).get_profile()
 
+    async def get_group_title(self, account: str, group_id: int) -> str:
+        return await self.get(account).get_group_title(group_id)
+
     async def update_text_profile(self, account: str, nickname: str, about: str | None = None):
         return await self.get(account).update_text_profile(nickname, about)
+
+    async def refresh_account_client(self, account: str):
+        await self.get(account).reset_client()
 
 
 multi_manager = MultiTelegramManager(CONFIG.ACCOUNTS)

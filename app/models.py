@@ -7,6 +7,8 @@ class SendLog(Base):
     __tablename__ = "send_logs"
 
     id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(String(64), index=True, nullable=True)
+    task_round = Column(Integer, nullable=True)
     account_name = Column(String(64), index=True)
     group_id = Column(Integer, index=True)
     group_title = Column(String(255))
@@ -41,6 +43,7 @@ class Task(Base):
     parse_mode = Column(String(16))
     disable_web_page_preview = Column(Integer)
     delay_ms = Column(Integer)
+    delay_scope = Column(String(32), default="per_account")
     current_index = Column(Integer)
     group_ids_json = Column(Text)
     request_id = Column(String(128), nullable=True)
@@ -76,6 +79,20 @@ class AccountHealth(Base):
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     last_join_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AccountProxy(Base):
+    __tablename__ = "account_proxies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_name = Column(String(64), unique=True, index=True)
+    enabled = Column(Integer, default=1)
+    proxy_type = Column(String(16), default="socks5")
+    host = Column(String(255))
+    port = Column(Integer)
+    username = Column(String(255), nullable=True)
+    password = Column(String(255), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 

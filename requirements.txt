@@ -1,7 +1,9 @@
 starlette==0.27.0
 uvicorn==0.32.0
-telethon==1.32.0
+telethon==1.44.0
+python-socks[asyncio]==2.7.2
 python-dotenv==1.0.1
 SQLAlchemy==2.0.36
 Jinja2==3.1.4
 python-multipart==0.0.9
+PySocks==1.7.1

@@ -5,6 +5,7 @@ from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from app.models import SendLog
 from app.config import CONFIG
+from app.telegram_client import _extract_forward_source, _extract_inline_bot_query
 
 class SendScheduler:
     def __init__(self, db: Session):
@@ -94,6 +95,8 @@ class SendScheduler:
 
     def fingerprint_message(self, message: str, parse_mode: Optional[str]) -> str:
         if not bool(getattr(CONFIG, "MESSAGE_FINGERPRINT_ENABLED", 1)):
+            return message
+        if _extract_inline_bot_query(message)[0] or _extract_forward_source(message)[0] is not None:
             return message
         if parse_mode and parse_mode in ("markdown", "html"):
             return self._whitespace_jitter(message)

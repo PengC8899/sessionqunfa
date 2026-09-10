@@ -1,12 +1,71 @@
 import asyncio
+import re
 from typing import List, Optional
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneNumberInvalidError
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, User
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.functions.messages import GetFullChatRequest
 from app.config import CONFIG
 import os
+
+
+INLINE_BOT_USERNAME = "PostBot"
+
+
+def _looks_like_postbot_code(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw or " " in raw or len(raw) < 10 or len(raw) > 128:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", raw):
+        return False
+    return bool(re.search(r"\d", raw))
+
+
+def _extract_inline_bot_query(text: str) -> tuple[Optional[str], Optional[str]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    inline_match = re.match(r"^@([A-Za-z0-9_]{5,32})\s+(.+)$", raw)
+    if inline_match:
+        bot_username = inline_match.group(1)
+        query = inline_match.group(2).strip()
+        return (bot_username, query) if query else (None, None)
+
+    prefix_match = re.match(r"^(postbot)\s*[:\s]\s*(.+)$", raw, flags=re.IGNORECASE)
+    if prefix_match:
+        query = prefix_match.group(2).strip()
+        return (INLINE_BOT_USERNAME, query) if query else (None, None)
+
+    if _looks_like_postbot_code(raw):
+        return INLINE_BOT_USERNAME, raw
+
+    return None, None
+
+
+def _extract_forward_source(text: str) -> tuple[Optional[object], Optional[int]]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+
+    private_match = re.match(
+        r"^(?:https?://)?t\.me/c/(\d+)/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if private_match:
+        return int(f"-100{private_match.group(1)}"), int(private_match.group(2))
+
+    public_match = re.match(
+        r"^(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{5,32})/(\d+)(?:\?.*)?$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if public_match:
+        return public_match.group(1), int(public_match.group(2))
+
+    return None, None
 
 
 class AccountClientManager:
@@ -16,6 +75,7 @@ class AccountClientManager:
         self.api_hash = api_hash
         self.client: Optional[TelegramClient] = None
         self._connected = False
+        self._started_inline_bots: set[str] = set()
 
     async def ensure_connected(self):
         if not self._connected:
@@ -116,6 +176,69 @@ class AccountClientManager:
         disable_web_page_preview: bool,
     ) -> tuple[bool, Optional[str], Optional[int]]:
         await self.ensure_connected()
+        source_peer, source_message_id = _extract_forward_source(text)
+        if source_peer is not None and source_message_id is not None:
+            try:
+                target_ent = await self.client.get_entity(group_id)
+                if isinstance(target_ent, User):
+                    return False, "peer_is_user", None
+                if isinstance(source_peer, str):
+                    source_ent = await self.client.get_entity(source_peer)
+                else:
+                    source_ent = await self.client.get_entity(source_peer)
+                if isinstance(source_ent, Channel):
+                    try:
+                        from telethon.tl.functions.channels import JoinChannelRequest
+                        await self.client(JoinChannelRequest(source_ent))
+                    except Exception:
+                        pass
+                src_msg = await self.client.get_messages(source_ent, ids=source_message_id)
+                if not src_msg:
+                    return False, "forward_source_message_not_found", None
+                msg = await self.client.forward_messages(
+                    entity=target_ent,
+                    messages=[source_message_id],
+                    from_peer=source_ent,
+                )
+                if isinstance(msg, list):
+                    msg = msg[0] if msg else None
+                mid = getattr(msg, "id", None) if msg else None
+                return True, None, mid
+            except Exception as e:
+                return False, f"forward_send_failed: {e}", None
+        bot_username, inline_query = _extract_inline_bot_query(text)
+        if bot_username and inline_query:
+            try:
+                normalized = (bot_username or "").lstrip("@").strip()
+                cache_key = normalized.lower()
+                if cache_key not in self._started_inline_bots:
+                    try:
+                        dialogs = await self.client.get_dialogs(limit=200)
+                        has_dialog = any(
+                            getattr(d.entity, "username", None)
+                            and getattr(d.entity, "username", "").lower() == cache_key
+                            for d in dialogs
+                        )
+                    except Exception:
+                        has_dialog = False
+                    if not has_dialog:
+                        try:
+                            bot_entity = await self.client.get_entity(normalized)
+                            await self.client.send_message(bot_entity, "/start")
+                        except Exception:
+                            pass
+                    self._started_inline_bots.add(cache_key)
+                ent = await self.client.get_entity(group_id)
+                if isinstance(ent, User):
+                    return False, "peer_is_user", None
+                results = await self.client.inline_query(bot_username, inline_query, entity=ent)
+                if not results:
+                    return False, "inline_no_results", None
+                msg = await results[0].click(entity=ent, hide_via=True)
+                mid = getattr(msg, "id", None)
+                return True, None, mid
+            except Exception as e:
+                return False, f"inline_send_failed: {e}", None
         pm = None
         if parse_mode == "markdown":
             pm = "markdown"

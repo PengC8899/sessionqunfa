@@ -1,0 +1,21 @@
+name: sessionqunfa_isolated
+
+services:
+  isolated_web:
+    build: .
+    image: sessionqunfa-local-isolated
+    container_name: tg-local-web-isolated
+    ports:
+      - "8003:8000"
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=debug
+      - SESSION_DIR=/sessions
+      - DB_URL=sqlite:////app/data/data.db
+    volumes:
+      - ./sessions-isolated:/sessions
+      - ./data-isolated:/app/data
+      - ./templates:/app/templates:ro
+      - ./static:/app/static:ro
+    restart: unless-stopped

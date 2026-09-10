@@ -6,8 +6,20 @@ from starlette.responses import StreamingResponse, Response
 from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 from app.config import CONFIG
-from app.database import Base, engine, SessionLocal
-from sqlalchemy import text
+from app.database import (
+    Base,
+    engine,
+    export_task_migration_manifest,
+    SessionLocal,
+    export_task_runtime_snapshot,
+    is_database_malformed_error,
+    is_sqlite_enabled,
+    sqlite_checkpoint,
+    sqlite_ensure_task_runtime_indexes,
+    sqlite_health_check,
+)
+from sqlalchemy import text, func
+from sqlalchemy.exc import DatabaseError
 from app.telegram_client import multi_manager, set_copy_receiver, set_on_private_message
 from sqlalchemy.orm import Session
 from app.models import SendLog, Task, TaskEvent, SystemKV
@@ -16,21 +28,36 @@ from app.services.group_service import (
     get_groups,
     clear_group_cache,
     add_banned_group,
+    get_banned_group_ids,
     should_exclude_group_on_error,
     should_add_to_blist,
+    should_add_to_global_blist,
 )
 # from app.services.multi_account_sender import get_multi_sender  # 暂不使用
 from app.routers.accounts import (
+    auto_assign_account_proxies,
     check_single_account,
     delete_account,
     bulk_update_profile,
+    get_default_account_proxy_source,
     get_account_profile,
+    get_account_proxy,
     get_authorized_profiles,
+    update_default_account_proxy_source,
+    update_account_proxy,
     update_account_profile,
 )
 from app.routers.system import reset_system
 from app.services.account_service import account_service
 from app.services.dispatch_layer import classify_groups, classify_account, select_groups_for_account, dynamic_delay_ms, randomize_message, recent_fail_rate, unique_group_ids, sort_groups_for_account, distribute_groups_unique
+from app.services.proxy_service import (
+    get_default_proxy_source,
+    assign_proxy_pool_to_accounts,
+    delete_proxy_binding,
+    list_proxy_bindings,
+    resolve_proxy_source_text,
+    upsert_proxy_binding,
+)
 import json
 import time
 import uuid
@@ -38,6 +65,8 @@ import asyncio
 import os
 import random
 import logging
+import io
+import zipfile
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone
 import tempfile
@@ -52,6 +81,18 @@ app.add_middleware(
 
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+def _normalize_account_names(accounts) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for account in accounts or []:
+        name = str(account or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
 
 def _discover_session_accounts() -> list[str]:
     session_dir = CONFIG.SESSION_DIR
@@ -72,6 +113,76 @@ def _discover_session_accounts() -> list[str]:
     return sorted(set(names))
 
 
+def _candidate_accounts(accounts=None) -> list[str]:
+    if accounts:
+        return _normalize_account_names(accounts)
+    session_dir = CONFIG.SESSION_DIR
+    names: list[str] = []
+    count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
+    prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
+    for i in range(1, count + 1):
+        name = f"{prefix}_{i:02d}"
+        if os.path.exists(os.path.join(session_dir, f"{name}.session")):
+            names.append(name)
+    names.extend(_discover_session_accounts())
+    return _normalize_account_names(names)
+
+
+async def _is_authorized_account(account: str, timeout_s: float | None = None) -> bool:
+    timeout = max(float(timeout_s or getattr(CONFIG, "ACCOUNT_AUTH_CHECK_TIMEOUT_S", 12)), 3.0)
+    try:
+        return bool(await asyncio.wait_for(multi_manager.is_authorized(account), timeout=timeout))
+    except Exception:
+        return False
+
+
+async def _split_authorized_accounts(accounts, timeout_s: float | None = None, concurrency: int = 4) -> tuple[list[str], list[str]]:
+    names = _normalize_account_names(accounts)
+    if not names:
+        return [], []
+    sem = asyncio.Semaphore(max(1, int(concurrency or 1)))
+
+    async def check(account: str) -> tuple[str, bool]:
+        async with sem:
+            ok = await _is_authorized_account(account, timeout_s=timeout_s)
+            return account, ok
+
+    results = await asyncio.gather(*(check(account) for account in names))
+    authorized = [account for account, ok in results if ok]
+    rejected = [account for account, ok in results if not ok]
+    return authorized, rejected
+
+
+def _self_check_account_helpers() -> None:
+    assert _normalize_account_names(["acc1", "", "acc1", None, " acc2 "]) == ["acc1", "acc2"]
+
+
+_self_check_account_helpers()
+
+
+def _purge_account_tasks(db: Session, account_name: str) -> dict:
+    task_ids = [row[0] for row in db.query(Task.id).filter(Task.account_name == account_name).all()]
+    active_tasks = db.query(Task).filter(Task.account_name == account_name, Task.status == "running").count()
+    events_deleted = 0
+    tasks_deleted = 0
+    if task_ids:
+        events_deleted = (
+            db.query(TaskEvent)
+            .filter(TaskEvent.task_id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        tasks_deleted = (
+            db.query(Task)
+            .filter(Task.id.in_(task_ids))
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    return {
+        "active_tasks_deleted": int(active_tasks or 0),
+        "task_records_deleted": int(tasks_deleted or 0),
+        "task_events_deleted": int(events_deleted or 0),
+    }
+
 @app.middleware("http")
 async def admin_token_middleware(request, call_next):
     token = request.headers.get("X-Admin-Token")
@@ -82,7 +193,7 @@ async def admin_token_middleware(request, call_next):
 
 @app.route("/")
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse("vue_index.html", {"request": request})
 
 @app.route("/api/accounts/status")
 async def list_accounts_status(request: Request):
@@ -109,10 +220,49 @@ async def list_accounts_status(request: Request):
             if n and n not in seen:
                 names.append(n)
                 seen.add(n)
-    data = []
-    for name in names:
+    db = SessionLocal()
+    try:
+        proxy_map = list_proxy_bindings(db, names)
+    finally:
+        db.close()
+    async def inspect_one(name: str) -> dict:
         session_path = os.path.join(session_dir, f"{name}.session")
-        data.append({"account": name, "authorized": os.path.exists(session_path)})
+        session_exists = os.path.exists(session_path)
+        if not session_exists:
+            return {
+                "account": name,
+                "authorized": False,
+                "status": "missing_file",
+                "detail": "Session 文件不存在",
+                "proxy": proxy_map.get(name),
+                "has_proxy": bool(proxy_map.get(name)),
+            }
+        try:
+            result = await account_service.check_account(name, use_cache=True, include_group_send_check=False)
+        except Exception as exc:
+            result = {"status": "error", "valid": False, "detail": str(exc)[:120]}
+        status = result.get("status") or "unknown"
+        detail = result.get("detail")
+        if not detail:
+            if status == "ok":
+                detail = "账号可用"
+            elif status == "unauthorized":
+                detail = "Telegram session 未授权"
+            elif status == "banned":
+                detail = "账号已被 Telegram 封禁"
+            elif status == "connect_failed":
+                detail = "连接 Telegram 失败"
+        return {
+            "account": name,
+            "authorized": bool(result.get("valid")) and status not in {"cannot_send", "unauthorized", "banned", "auth_error", "connect_failed", "error", "unknown", "missing_file"},
+            "status": status,
+            "detail": detail,
+            "phone": result.get("phone"),
+            "proxy": proxy_map.get(name),
+            "has_proxy": bool(proxy_map.get(name)),
+        }
+
+    data = await asyncio.gather(*(inspect_one(name) for name in names))
     return JSONResponse(data)
 
 app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=["POST"])
@@ -170,6 +320,11 @@ app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=
 app.add_route("/api/accounts/profile", get_account_profile, methods=["GET"])
 app.add_route("/api/accounts/profiles-authorized", get_authorized_profiles, methods=["GET"])
 app.add_route("/api/accounts/profile", update_account_profile, methods=["POST"])
+app.add_route("/api/accounts/proxy", get_account_proxy, methods=["GET"])
+app.add_route("/api/accounts/proxy", update_account_proxy, methods=["POST"])
+app.add_route("/api/accounts/proxy/default-source", get_default_account_proxy_source, methods=["GET"])
+app.add_route("/api/accounts/proxy/default-source", update_default_account_proxy_source, methods=["POST"])
+app.add_route("/api/accounts/proxy/auto-assign", auto_assign_account_proxies, methods=["POST"])
 app.add_route("/api/system/reset", reset_system, methods=["POST"])
 
 
@@ -189,51 +344,142 @@ async def upload_sessions(request: Request):
     uploaded = 0
     errors = []
     validated_accounts = []
+    uploaded_accounts: list[str] = []
+    proxy_bindings_raw = form.get("proxy_bindings")
+    proxy_source_text = form.get("proxy_source_text")
+    resolved_proxy_source_text = str(proxy_source_text or "").strip()
+    proxy_bindings: dict[str, str] = {}
+    proxy_pool: list[str] = []
+    proxy_meta: dict = {}
+    if proxy_bindings_raw:
+        try:
+            parsed_bindings = json.loads(str(proxy_bindings_raw))
+            if isinstance(parsed_bindings, dict):
+                proxy_bindings = {
+                    str(k).strip(): (str(v).strip() if v is not None else "")
+                    for k, v in parsed_bindings.items()
+                    if str(k).strip()
+                }
+        except Exception:
+            errors.append("proxy_bindings: JSON 格式无效，已忽略代理绑定")
+    if not resolved_proxy_source_text:
+        db = SessionLocal()
+        try:
+            resolved_proxy_source_text = get_default_proxy_source(db)
+        finally:
+            db.close()
+    extra_map, proxy_pool, proxy_meta = resolve_proxy_source_text(resolved_proxy_source_text, errors)
+    proxy_bindings.update(extra_map)
     
+    os.makedirs(CONFIG.SESSION_DIR, exist_ok=True)
+
+    async def persist_session(account_name: str, content: bytes):
+        nonlocal uploaded
+        target_path = os.path.join(CONFIG.SESSION_DIR, f"{account_name}.session")
+
+        with open(target_path, "wb") as f:
+            f.write(content)
+
+        if account_name in multi_manager.managers:
+            try:
+                await multi_manager.managers[account_name].disconnect()
+                logging.info(f"[UPLOAD] Disconnected old session for {account_name}")
+            except Exception:
+                pass
+        if account_name not in uploaded_accounts:
+            uploaded_accounts.append(account_name)
+
+        try:
+            file_size = os.path.getsize(target_path)
+            if file_size > 5000:
+                if account_name not in validated_accounts:
+                    validated_accounts.append(account_name)
+                logging.info(f"[UPLOAD] Session file uploaded for {account_name} ({file_size} bytes)")
+            else:
+                errors.append(f"{account_name}: 文件太小，可能损坏 ({file_size} bytes)")
+        except Exception as e:
+            errors.append(f"{account_name}: 文件检查失败 - {str(e)[:50]}")
+
+        uploaded += 1
+
     for file in files:
         try:
-            filename = file.filename
-            if not filename.endswith('.session'):
-                errors.append(f"{filename}: 不是 .session 文件")
-                continue
-            
-            # 提取账号名 (去掉 .session 后缀)
-            account_name = filename[:-8]  # Remove .session
-            target_path = os.path.join(CONFIG.SESSION_DIR, filename)
-            
-            # 保存文件
+            filename = (file.filename or "").strip()
+            lower_name = filename.lower()
             content = await file.read()
-            with open(target_path, 'wb') as f:
-                f.write(content)
-            
-            # 断开旧连接（如果存在）
-            if account_name in multi_manager.managers:
+
+            if lower_name.endswith(".session"):
+                account_name = os.path.basename(filename)[:-8]
+                if not account_name:
+                    errors.append(f"{filename}: 文件名无效")
+                    continue
+                await persist_session(account_name, content)
+                continue
+
+            if lower_name.endswith(".zip"):
                 try:
-                    await multi_manager.managers[account_name].disconnect()
-                    logging.info(f"[UPLOAD] Disconnected old session for {account_name}")
-                except Exception:
-                    pass
-            
-            # 简单验证：只检查文件大小，不实际连接（避免数据库操作）
-            try:
-                import os as os_module
-                file_size = os_module.path.getsize(target_path)
-                if file_size > 5000:  # Session 文件通常大于 5KB
-                    validated_accounts.append(account_name)
-                    logging.info(f"[UPLOAD] Session file uploaded for {account_name} ({file_size} bytes)")
-                else:
-                    errors.append(f"{account_name}: 文件太小，可能损坏 ({file_size} bytes)")
-            except Exception as e:
-                errors.append(f"{account_name}: 文件检查失败 - {str(e)[:50]}")
-            
-            uploaded += 1
+                    archive = zipfile.ZipFile(io.BytesIO(content))
+                except zipfile.BadZipFile:
+                    errors.append(f"{filename}: ZIP 文件损坏或格式不正确")
+                    continue
+
+                members = [
+                    info for info in archive.infolist()
+                    if not info.is_dir() and info.filename.lower().endswith(".session")
+                ]
+                if not members:
+                    errors.append(f"{filename}: ZIP 中未找到 .session 文件")
+                    continue
+
+                for info in members:
+                    account_name = os.path.basename(info.filename)[:-8]
+                    if not account_name:
+                        errors.append(f"{filename}: {info.filename} 文件名无效")
+                        continue
+                    try:
+                        await persist_session(account_name, archive.read(info))
+                    except Exception as e:
+                        errors.append(f"{filename}: {info.filename} - {str(e)[:80]}")
+                continue
+
+            errors.append(f"{filename}: 仅支持 .session 或 .zip 文件")
         except Exception as e:
             errors.append(f"{file.filename}: {str(e)}")
+
+    assigned_proxy_bindings, assignment_meta = assign_proxy_pool_to_accounts(
+        uploaded_accounts,
+        proxy_bindings,
+        proxy_pool,
+    )
+    if assignment_meta.get("unassigned_accounts"):
+        errors.append(
+            "代理数量不足："
+            f"已绑定 {assignment_meta.get('assigned_total', 0)} / {assignment_meta.get('accounts_total', 0)} 个上传账号，"
+            f"未分配账号 {', '.join(assignment_meta.get('unassigned_accounts', [])[:20])}"
+        )
+
+    if assigned_proxy_bindings:
+        for account_name in uploaded_accounts:
+            if account_name not in assigned_proxy_bindings:
+                continue
+            db = SessionLocal()
+            try:
+                try:
+                    upsert_proxy_binding(db, account_name, assigned_proxy_bindings.get(account_name), enabled=True)
+                except ValueError as e:
+                    errors.append(f"{account_name}: 代理格式错误 - {str(e)}")
+            finally:
+                db.close()
     
     return JSONResponse({
         "uploaded": uploaded,
         "validated": len(validated_accounts),
         "validated_accounts": validated_accounts,
+        "proxy_assigned": int(assignment_meta.get("assigned_total", 0)),
+        "proxy_accounts_total": int(assignment_meta.get("accounts_total", 0)),
+        "proxy_source_text": resolved_proxy_source_text,
+        "proxy_source_meta": proxy_meta,
+        "proxy_assignment_meta": assignment_meta,
         "errors": errors if errors else None
     })
 
@@ -263,24 +509,13 @@ async def bulk_delete_accounts(request: Request):
     results = []
     try:
         for name in cleaned:
-            stopped = 0
+            task_cleanup = {
+                "active_tasks_deleted": 0,
+                "task_records_deleted": 0,
+                "task_events_deleted": 0,
+            }
             try:
-                rows = db.query(Task).filter(Task.account_name == name, Task.status == "running").all()
-                for t in rows:
-                    t.stop_requested = 1
-                    t.status = "stopped"
-                    t.finished_at = CONFIG.now()
-                    db.add(
-                        TaskEvent(
-                            task_id=t.id,
-                            event="account_deleted",
-                            detail="account_session_deleted_by_admin",
-                            meta_json=json.dumps({"account": name}, ensure_ascii=False),
-                        )
-                    )
-                if rows:
-                    db.commit()
-                stopped = len(rows)
+                task_cleanup = _purge_account_tasks(db, name)
             except Exception:
                 db.rollback()
             deleted = False
@@ -292,13 +527,16 @@ async def bulk_delete_accounts(request: Request):
                     except Exception:
                         pass
                 deleted = await account_service.delete_session(name)
+                delete_proxy_binding(db, name)
             except Exception as e:
                 error = str(e)[:200]
             results.append(
                 {
                     "account": name,
                     "deleted": bool(deleted),
-                    "tasks_stopped": stopped,
+                    "tasks_stopped": task_cleanup["active_tasks_deleted"],
+                    "task_records_deleted": task_cleanup["task_records_deleted"],
+                    "task_events_deleted": task_cleanup["task_events_deleted"],
                     "error": error,
                 }
             )
@@ -448,10 +686,7 @@ async def list_groups(request: Request):
     refresh = request.query_params.get("refresh", "false").lower() in ("1", "true", "yes")
     if getattr(CONFIG, "GROUP_CACHE_ENABLED", 1) == 0:
         refresh = True
-    try:
-        authorized = await multi_manager.is_authorized(account)
-    except Exception:
-        authorized = False
+    authorized = await _is_authorized_account(account)
     if not authorized:
         return JSONResponse({"detail": "session_not_authorized"}, status_code=403)
     db: Session = SessionLocal()
@@ -492,7 +727,7 @@ async def debug_groups(request: Request):
     except Exception:
         pass
     try:
-        authorized = await multi_manager.is_authorized(account)
+        authorized = await _is_authorized_account(account)
         info["authorized"] = bool(authorized)
         if not authorized:
             return JSONResponse(info)
@@ -553,13 +788,10 @@ async def send(request: Request):
     retry_delay_ms = int(body.get("retry_delay_ms", getattr(CONFIG, "SEND_RETRY_DELAY_MS", 1500)))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
-    ok, reason = _check_request_guard(token, request_id)
+    ok, _reason = _check_request_guard(token, request_id)
     if not ok:
         return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
-    try:
-        authorized = await multi_manager.is_authorized(account)
-    except Exception:
-        authorized = False
+    authorized = await _is_authorized_account(account)
     if not authorized:
         return JSONResponse({"detail": "session_not_authorized"}, status_code=403)
     if not group_ids or not message:
@@ -586,13 +818,10 @@ async def test_send(request: Request):
     retry_max = int(body.get("retry_max", getattr(CONFIG, "SEND_RETRY_MAX", 0)))
     retry_delay_ms = int(body.get("retry_delay_ms", getattr(CONFIG, "SEND_RETRY_DELAY_MS", 1500)))
     request_id = body.get("request_id")
-    ok, reason = _check_request_guard(token, request_id)
+    ok, _reason = _check_request_guard(token, request_id)
     if not ok:
         return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
-    try:
-        authorized = await multi_manager.is_authorized(account)
-    except Exception:
-        authorized = False
+    authorized = await _is_authorized_account(account)
     if not authorized:
         return JSONResponse({"detail": "session_not_authorized"}, status_code=403)
     if not group_ids or not message:
@@ -704,6 +933,10 @@ async def startup_event():
             conn.execute(text("PRAGMA journal_mode=WAL;"))
             cols = conn.execute(text("PRAGMA table_info('send_logs')")).fetchall()
             names = {c[1] for c in cols}
+            if 'task_id' not in names:
+                conn.execute(text("ALTER TABLE send_logs ADD COLUMN task_id VARCHAR(64)"))
+            if 'task_round' not in names:
+                conn.execute(text("ALTER TABLE send_logs ADD COLUMN task_round INTEGER"))
             if 'account_name' not in names:
                 conn.execute(text("ALTER TABLE send_logs ADD COLUMN account_name VARCHAR(64)"))
             if 'message_id' not in names:
@@ -721,6 +954,8 @@ async def startup_event():
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN round_interval_s INTEGER DEFAULT 0"))
             if 'next_round_at' not in task_names:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN next_round_at DATETIME"))
+            if 'delay_scope' not in task_names:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN delay_scope VARCHAR(32) DEFAULT 'per_account'"))
             conn.commit()
     except Exception:
         pass
@@ -766,10 +1001,33 @@ async def startup_event():
 
     # 设置 account_service 的 manager 引用（用于健康检查）
     account_service.set_manager(multi_manager)
+
+    if is_sqlite_enabled():
+        try:
+            prepare_result = sqlite_ensure_task_runtime_indexes()
+            manifest_path = export_task_migration_manifest("startup")
+            health = sqlite_health_check("quick_check")
+            if not health.get("ok", False):
+                snapshot_path = _capture_task_db_snapshot("startup_healthcheck_failed")
+                print(f"[STARTUP][TASK_DB] health_check failed: {health.get('result')} snapshot={snapshot_path}")
+            else:
+                snapshot_path = _capture_task_db_snapshot("startup")
+                sqlite_checkpoint("PASSIVE")
+                if snapshot_path:
+                    print(f"[STARTUP][TASK_DB] startup snapshot saved: {snapshot_path}")
+            if prepare_result.get("indexes") or manifest_path:
+                print(
+                    "[STARTUP][TASK_DB] prepared "
+                    f"indexes={len(prepare_result.get('indexes', []))} "
+                    f"manifest={manifest_path}"
+                )
+        except Exception as exc:
+            print(f"[STARTUP][TASK_DB] health bootstrap failed: {exc}")
     
     # 启动定期清理空闲连接的后台任务
     asyncio.create_task(_periodic_connection_cleanup())
     asyncio.create_task(_periodic_task_cleanup())
+    asyncio.create_task(_periodic_sqlite_maintenance())
 
     db: Session = SessionLocal()
     try:
@@ -791,29 +1049,20 @@ async def startup_event():
             return
         for t in rows:
             try:
-                gids = json.loads(t.group_ids_json or "[]")
-                # Resume from correct round and index
-                start_round = max(0, (t.current_round or 1) - 1)
-                start_idx = max(0, (t.current_index or 0))
-                
-                if gids:
-                    # Add stagger to prevent thundering herd on restart
-                    start_delay = random.uniform(5, 60)
-                    print(f"[STARTUP] Resuming task {t.id} for {t.account_name} at round {t.current_round} index {t.current_index} with delay {start_delay:.1f}s")
-                    asyncio.create_task(_run_send_task_with_delay(
-                        task_id=t.id, 
-                        account=t.account_name, 
-                        group_ids=gids, 
-                        message=t.message, 
-                        parse_mode=t.parse_mode, 
-                        disable_web_page_preview=bool(t.disable_web_page_preview), 
-                        delay_ms=t.delay_ms, 
-                        rounds=t.rounds or 1, 
-                        round_interval_s=t.round_interval_s or 0,
-                        start_round_idx=start_round,
-                        start_group_idx=start_idx,
-                        start_delay=start_delay
-                    ))
+                start_delay = random.uniform(
+                    max(int(getattr(CONFIG, "STARTUP_RESUME_MIN_DELAY_S", 5)), 0),
+                    max(int(getattr(CONFIG, "STARTUP_RESUME_MAX_DELAY_S", 45)), 0),
+                )
+                print(
+                    f"[STARTUP] Resuming task {t.id} for {t.account_name} "
+                    f"at round {t.current_round} index {t.current_index} "
+                    f"with delay {start_delay:.1f}s"
+                )
+                await _resume_existing_task(
+                    t,
+                    reason="startup_resume",
+                    start_delay=start_delay,
+                )
             except Exception:
                 pass
     finally:
@@ -822,12 +1071,14 @@ async def startup_event():
 
 _REQ_IDS: dict[str, float] = {}
 _LAST_TS: dict[str, float] = {}
+_GLOBAL_SEND_NEXT_AT_BY_BUCKET: dict[str, float] = {}
+_GLOBAL_SEND_SLOT_LOCK = asyncio.Lock()
 
 
 async def _periodic_connection_cleanup():
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(max(int(getattr(CONFIG, "CONNECTION_CLEANUP_INTERVAL_S", 60)), 10))
             await multi_manager._cleanup_idle_connections()
         except Exception as e:
             print(f"[CLEANUP] Error: {e}")
@@ -835,33 +1086,69 @@ async def _periodic_connection_cleanup():
 async def _periodic_task_cleanup():
     while True:
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(max(int(getattr(CONFIG, "TASK_CLEANUP_INTERVAL_S", 60)), 10))
             db: Session = SessionLocal()
             try:
                 now = CONFIG.now()
-                timeout_s = int(getattr(CONFIG, "TASK_STUCK_TIMEOUT_S", 900))
-                rows = db.query(Task).filter(Task.status == "running").limit(200).all()
+                timeout_s = int(getattr(CONFIG, "TASK_STUCK_TIMEOUT_S", 1800))
+                missing_runner_timeout_s = int(getattr(CONFIG, "TASK_RUNNER_MISSING_TIMEOUT_S", 120))
+                rows = db.query(Task).filter(Task.status == "running").limit(500).all()
                 for t in rows:
-                    if int(t.paused or 0) == 1:
+                    if int(t.paused or 0) == 1 or int(t.stop_requested or 0) == 1:
                         continue
                     hb = t.heartbeat_at or t.started_at
-                    if hb:
-                        if hb.tzinfo is None:
-                            now_cmp = datetime.utcnow()
-                        else:
-                            now_cmp = now
-                            if now_cmp.tzinfo is None:
-                                now_cmp = now_cmp.replace(tzinfo=hb.tzinfo)
-                    if hb and (now_cmp - hb).total_seconds() > timeout_s:
+                    if not hb:
+                        continue
+                    heartbeat_age_s = _seconds_since_task_timestamp(hb)
+                    if not _task_runner_active(t.id):
+                        if (
+                            int(getattr(CONFIG, "RESUME_TASKS_ON_STARTUP", 1)) == 1
+                            and heartbeat_age_s >= missing_runner_timeout_s
+                        ):
+                            if await _resume_existing_task(
+                                t,
+                                reason="watchdog_runner_missing",
+                                start_delay=0.0,
+                            ):
+                                continue
+                    if heartbeat_age_s > timeout_s:
                         t.status = "error"
                         t.stop_requested = 1
                         t.finished_at = now
-                        db.add(TaskEvent(task_id=t.id, event="stuck_timeout", detail=str(timeout_s), meta_json=json.dumps({}, ensure_ascii=False)))
-                db.commit()
+                        db.add(TaskEvent(
+                            task_id=t.id,
+                            event="stuck_timeout",
+                            detail=str(timeout_s),
+                            meta_json=json.dumps({"heartbeat_age_s": int(heartbeat_age_s)}, ensure_ascii=False),
+                        ))
+                try:
+                    db.commit()
+                except DatabaseError as exc:
+                    db.rollback()
+                    _handle_task_db_error("periodic_task_cleanup_commit", exc)
             finally:
                 db.close()
+        except DatabaseError as exc:
+            _handle_task_db_error("periodic_task_cleanup", exc)
         except Exception as e:
             print(f"[CLEANUP] Error: {e}")
+
+
+async def _periodic_sqlite_maintenance():
+    if not is_sqlite_enabled():
+        return
+    while True:
+        try:
+            await asyncio.sleep(max(int(getattr(CONFIG, "SQLITE_HEALTHCHECK_INTERVAL_S", 300)), 60))
+            health = sqlite_health_check("quick_check")
+            if not health.get("ok", False):
+                snapshot_path = _capture_task_db_snapshot("sqlite_healthcheck_failed")
+                print(f"[TASK_DB] quick_check failed: {health.get('result')} snapshot={snapshot_path}")
+                continue
+            sqlite_ensure_task_runtime_indexes()
+            sqlite_checkpoint("PASSIVE")
+        except Exception as e:
+            print(f"[TASK_DB] maintenance error: {e}")
 
 
 def _check_request_guard(token: str, request_id: str | None, window_ms: int = 500):
@@ -884,6 +1171,100 @@ def _check_request_guard(token: str, request_id: str | None, window_ms: int = 50
     return True, None
 
 
+def _normalize_delay_scope(raw_scope: str | None, default: str = "per_account") -> str:
+    scope = str(raw_scope or default).strip().lower()
+    if scope not in {"per_account", "global"}:
+        return default
+    return scope
+
+
+def _prefer_per_account_delay_scope(
+    raw_scope: str | None,
+    request_id: str | None,
+    has_sibling_tasks: bool,
+) -> str:
+    scope = _normalize_delay_scope(raw_scope, "per_account")
+    if scope == "global" and str(request_id or "").strip() and has_sibling_tasks:
+        return "per_account"
+    return scope
+
+
+def _prefer_batch_delay_ms(delay_ms: int, has_sibling_tasks: bool) -> int:
+    value = max(0, int(delay_ms or 0))
+    if has_sibling_tasks and value >= 11000:
+        return 3000
+    return value
+
+
+def _task_has_sibling_tasks(db: Session, task: Task | None, task_id: str) -> tuple[str, bool]:
+    if task is None:
+        return "", False
+    request_id = str(getattr(task, "request_id", "") or "").strip()
+    if not request_id:
+        return "", False
+    has_sibling_tasks = (
+        db.query(Task.id)
+        .filter(Task.request_id == request_id, Task.id != task_id)
+        .first()
+        is not None
+    )
+    return request_id, has_sibling_tasks
+
+
+def _effective_task_timing(db: Session, task: Task | None, task_id: str, delay_ms: int) -> tuple[str, int]:
+    if task is None:
+        return "per_account", max(0, int(delay_ms or 0))
+    request_id, has_sibling_tasks = _task_has_sibling_tasks(db, task, task_id)
+    scope = _prefer_per_account_delay_scope(getattr(task, "delay_scope", None), request_id, has_sibling_tasks)
+    effective_delay_ms = _prefer_batch_delay_ms(delay_ms, has_sibling_tasks)
+    return scope, effective_delay_ms
+
+
+def _self_check_delay_scope_helpers() -> None:
+    assert _prefer_per_account_delay_scope("global", "req-1", True) == "per_account"
+    assert _prefer_per_account_delay_scope("global", "req-1", False) == "global"
+    assert _prefer_per_account_delay_scope("per_account", "req-1", True) == "per_account"
+    assert _prefer_batch_delay_ms(11000, True) == 3000
+    assert _prefer_batch_delay_ms(3000, True) == 3000
+
+
+_self_check_delay_scope_helpers()
+
+
+def _compute_effective_task_delay_ms(account: str, delay_ms: int) -> int:
+    base_ms = max(int(delay_ms or 0), int(getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500)))
+    if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) != 1:
+        return base_ms
+    with SessionLocal() as db:
+        rate = recent_fail_rate(db, account, int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50)))
+    adjusted_ms = dynamic_delay_ms(base_ms, rate)
+    jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
+    jitter = random.uniform(-jitter_pct, jitter_pct) * adjusted_ms
+    return max(0, int(adjusted_ms + jitter))
+
+
+def _global_send_bucket_key(task: Task | None, task_id: str) -> str:
+    if task is None:
+        return task_id
+    request_id = str(getattr(task, "request_id", "") or "").strip()
+    if request_id:
+        return f"request:{request_id}"
+    return f"task:{task_id}"
+
+
+async def _reserve_global_send_slot(task_id: str, bucket_key: str, wait_s: float) -> bool:
+    delay_s = max(0.0, float(wait_s))
+    while True:
+        async with _GLOBAL_SEND_SLOT_LOCK:
+            now = time.monotonic()
+            remaining = _GLOBAL_SEND_NEXT_AT_BY_BUCKET.get(bucket_key, 0.0) - now
+            if remaining <= 0:
+                _GLOBAL_SEND_NEXT_AT_BY_BUCKET[bucket_key] = now + delay_s
+                return True
+        if not await _sleep_with_task_checks(task_id, remaining, refresh_heartbeat=True):
+            return False
+
+
 def _get_existing_tasks_by_request_id(db: Session, request_id: str | None) -> list[Task]:
     if not request_id:
         return []
@@ -901,6 +1282,111 @@ def _planned_group_count(group_ids_json: str | None) -> int:
     except Exception:
         return 0
     return len(group_ids) if isinstance(group_ids, list) else 0
+
+
+def _filter_account_banned_group_ids(db: Session, account: str, group_ids: list[int]) -> list[int]:
+    banned = set(get_banned_group_ids(db, account))
+    if not banned:
+        return unique_group_ids(group_ids)
+    return [gid for gid in unique_group_ids(group_ids) if int(gid) not in banned]
+
+
+def _remove_group_id_once(group_ids: list[int], gid: int) -> list[int]:
+    target = int(gid)
+    return [item for item in group_ids if int(item) != target]
+
+
+def _self_check_group_skip_helpers() -> None:
+    assert _remove_group_id_once([1, 2, 3], 2) == [1, 3]
+
+
+_self_check_group_skip_helpers()
+
+
+def _collect_task_log_counters(
+    db: Session,
+    task_ids: list[str],
+    current_round_by_task: dict[str, int] | None = None,
+    task_rows_by_id: dict[str, Task] | None = None,
+) -> dict[str, dict[str, int]]:
+    counters: dict[str, dict[str, int]] = {
+        task_id: {
+            "success": 0,
+            "failed": 0,
+            "overall_completed": 0,
+            "current_round_completed": 0,
+            "current_round_success": 0,
+            "current_round_failed": 0,
+        }
+        for task_id in task_ids
+        if task_id
+    }
+    if not counters:
+        return {}
+
+    rows = (
+        db.query(
+            SendLog.task_id,
+            SendLog.task_round,
+            SendLog.status,
+            func.count(SendLog.id),
+        )
+        .filter(
+            SendLog.task_id.in_(list(counters.keys())),
+            SendLog.status.in_(("success", "failed")),
+        )
+        .group_by(SendLog.task_id, SendLog.task_round, SendLog.status)
+        .all()
+    )
+
+    current_round_by_task = current_round_by_task or {}
+    for task_id, task_round, status, count in rows:
+        bucket = counters.get(task_id)
+        if not bucket:
+            continue
+        n = int(count or 0)
+        if status == "success":
+            bucket["success"] += n
+        elif status == "failed":
+            bucket["failed"] += n
+        bucket["overall_completed"] += n
+
+        if current_round_by_task.get(task_id) == int(task_round or 0):
+            bucket["current_round_completed"] += n
+            if status == "success":
+                bucket["current_round_success"] += n
+            elif status == "failed":
+                bucket["current_round_failed"] += n
+
+    # 兼容历史日志：旧版本 send_logs 没有 task_id/task_round，
+    # 回退到“账号 + 任务开始时间”聚合累计成功/失败。
+    task_rows_by_id = task_rows_by_id or {}
+    for task_id, bucket in counters.items():
+        if bucket["overall_completed"] > 0:
+            continue
+        task = task_rows_by_id.get(task_id)
+        if not task or not task.started_at or not task.account_name:
+            continue
+        legacy_rows = (
+            db.query(SendLog.status, func.count(SendLog.id))
+            .filter(
+                SendLog.task_id.is_(None),
+                SendLog.account_name == task.account_name,
+                SendLog.created_at >= task.started_at,
+                SendLog.status.in_(("success", "failed")),
+            )
+            .group_by(SendLog.status)
+            .all()
+        )
+        for status, count in legacy_rows:
+            n = int(count or 0)
+            if status == "success":
+                bucket["success"] += n
+            elif status == "failed":
+                bucket["failed"] += n
+            bucket["overall_completed"] += n
+
+    return counters
 
 
 def _serialize_log_created_at(value: datetime | None) -> str | None:
@@ -944,12 +1430,16 @@ async def _sleep_with_task_checks(
     seconds: float,
     step_s: float = 1.0,
     refresh_heartbeat: bool = True,
-    heartbeat_interval_s: float = 30.0,
+    heartbeat_interval_s: float | None = None,
 ) -> bool:
     remaining = max(0.0, float(seconds))
+    if heartbeat_interval_s is None:
+        heartbeat_interval_s = float(getattr(CONFIG, "TASK_HEARTBEAT_INTERVAL_S", 20))
     next_heartbeat_at = time.monotonic()
     while remaining > 0:
-        with SessionLocal() as db:
+        db: Session | None = None
+        try:
+            db = SessionLocal()
             if _mark_task_stopped_if_requested(db, task_id, "task_stopped_during_wait"):
                 return False
             if refresh_heartbeat and time.monotonic() >= next_heartbeat_at:
@@ -960,6 +1450,21 @@ async def _sleep_with_task_checks(
                     t.heartbeat_at = CONFIG.now()
                     db.commit()
                 next_heartbeat_at = time.monotonic() + max(1.0, float(heartbeat_interval_s))
+        except DatabaseError as exc:
+            if db is not None:
+                db.rollback()
+            _handle_task_db_error("sleep_with_task_checks", exc)
+            if refresh_heartbeat and time.monotonic() >= next_heartbeat_at:
+                _update_runtime_task_state(
+                    task_id,
+                    status=TASKS.get(task_id, {}).get("status") or "running",
+                    db_warning="task_db_unavailable",
+                    heartbeat_at=_runtime_state_iso_now(),
+                )
+                next_heartbeat_at = time.monotonic() + max(1.0, float(heartbeat_interval_s))
+        finally:
+            if db is not None:
+                db.close()
         wait_s = min(step_s, remaining)
         await asyncio.sleep(wait_s)
         remaining -= wait_s
@@ -968,8 +1473,314 @@ async def _sleep_with_task_checks(
 app.add_event_handler("startup", startup_event)
 
 TASKS: dict[str, dict] = {}
+_LAST_TASK_DB_SNAPSHOT_TS = 0.0
 
 LAST_COPY_MESSAGE: dict = {}
+
+
+def _runtime_state_iso_now() -> str:
+    try:
+        return CONFIG.now().isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def _update_runtime_task_state(task_id: str, **fields) -> None:
+    state = TASKS.get(task_id)
+    if not state:
+        state = {}
+        TASKS[task_id] = state
+    state.update(fields)
+    state["last_updated_at"] = _runtime_state_iso_now()
+
+
+def _capture_task_db_snapshot(reason: str) -> str | None:
+    global _LAST_TASK_DB_SNAPSHOT_TS
+    now = time.monotonic()
+    if now - _LAST_TASK_DB_SNAPSHOT_TS < 60:
+        return None
+    _LAST_TASK_DB_SNAPSHOT_TS = now
+    try:
+        return export_task_runtime_snapshot(reason)
+    except Exception as exc:
+        print(f"[TASK_DB] snapshot failed ({reason}): {exc}")
+        return None
+
+
+def _runtime_task_list_rows() -> list[dict]:
+    rows: list[dict] = []
+    for task_id, state in TASKS.items():
+        account = state.get("account")
+        if not account:
+            continue
+        rows.append(
+            {
+                "task_id": task_id,
+                "status": state.get("status") or ("running" if _task_runner_active(task_id) else "unknown"),
+                "total": int(state.get("total") or 0),
+                "success": int(state.get("success") or 0),
+                "failed": int(state.get("failed") or 0),
+                "current_index": int(state.get("current_index") or 0),
+                "account": account,
+                "delay_scope": _normalize_delay_scope(state.get("delay_scope"), "per_account"),
+                "started_at": state.get("started_at"),
+                "finished_at": state.get("finished_at"),
+                "rounds": int(state.get("rounds") or 0),
+                "current_round": int(state.get("current_round") or 0),
+                "next_round_at": state.get("next_round_at"),
+                "source": "runtime_fallback",
+                "db_warning": "task_db_unavailable",
+            }
+        )
+    rows.sort(key=lambda item: item.get("started_at") or "", reverse=True)
+    return rows
+
+
+def _runtime_task_summary_rows() -> list[dict]:
+    selected: dict[str, dict] = {}
+    for item in _runtime_task_list_rows():
+        account = item.get("account")
+        if not account:
+            continue
+        existing = selected.get(account)
+        if not existing:
+            selected[account] = item
+            continue
+        if existing.get("status") != "running" and item.get("status") == "running":
+            selected[account] = item
+            continue
+        if (item.get("started_at") or "") > (existing.get("started_at") or ""):
+            selected[account] = item
+
+    data: list[dict] = []
+    for item in selected.values():
+        completed = int(item.get("current_index") or 0)
+        total = int(item.get("total") or 0)
+        data.append(
+            {
+                "account": item.get("account"),
+                "status": item.get("status"),
+                "task_id": item.get("task_id"),
+                "delay_scope": item.get("delay_scope"),
+                "tasks_count": 1,
+                "total": total,
+                "success": int(item.get("success") or 0),
+                "failed": int(item.get("failed") or 0),
+                "completed": completed,
+                "progress_total": total,
+                "progress_completed": completed,
+                "current_round": int(item.get("current_round") or 0),
+                "rounds": int(item.get("rounds") or 0),
+                "current_round_planned": total,
+                "current_round_sent": completed,
+                "overall_planned": total,
+                "overall_completed": completed,
+                "last_updated_at": item.get("finished_at") or item.get("started_at") or item.get("last_updated_at"),
+                "source": "runtime_fallback",
+                "db_warning": "task_db_unavailable",
+            }
+        )
+    data.sort(key=lambda item: item.get("last_updated_at") or "", reverse=True)
+    return data
+
+
+def _runtime_task_status_payload(task_id: str) -> dict | None:
+    state = TASKS.get(task_id)
+    if not state:
+        return None
+    total = int(state.get("total") or 0)
+    completed = int(state.get("current_index") or 0)
+    return {
+        "task_id": task_id,
+        "status": state.get("status") or ("running" if _task_runner_active(task_id) else "unknown"),
+        "total": total,
+        "delay_scope": _normalize_delay_scope(state.get("delay_scope"), "per_account"),
+        "success": int(state.get("success") or 0),
+        "failed": int(state.get("failed") or 0),
+        "current_index": completed,
+        "current_round_planned": total,
+        "current_round_sent": completed,
+        "current_round_completed": completed,
+        "previous_rounds_completed": 0,
+        "overall_planned": total,
+        "overall_completed": completed,
+        "started_at": state.get("started_at"),
+        "finished_at": state.get("finished_at"),
+        "rounds": int(state.get("rounds") or 0),
+        "current_round": int(state.get("current_round") or 0),
+        "round_interval_s": int(state.get("round_interval_s") or 0),
+        "next_round_at": state.get("next_round_at"),
+        "source": "runtime_fallback",
+        "db_warning": "task_db_unavailable",
+    }
+
+
+def _handle_task_db_error(context: str, exc: Exception) -> None:
+    snapshot_path = _capture_task_db_snapshot(f"{context}_db_error")
+    suffix = f", snapshot={snapshot_path}" if snapshot_path else ""
+    malformed = " malformed" if is_database_malformed_error(exc) else ""
+    print(f"[TASK_DB]{malformed} {context} degraded: {exc}{suffix}")
+
+
+def _task_runner_active(task_id: str) -> bool:
+    state = TASKS.get(task_id)
+    if not state:
+        return False
+    runner = state.get("runner")
+    if runner is None or runner.done():
+        return False
+    return True
+
+
+def _register_task_runner(task_id: str, runner: asyncio.Task, meta: dict | None = None) -> None:
+    payload = {"runner": runner}
+    if meta:
+        payload.update(meta)
+    TASKS[task_id] = payload
+    _update_runtime_task_state(task_id, runner_done=False)
+
+    def _cleanup(done_task: asyncio.Task, tid: str = task_id):
+        current = TASKS.get(tid)
+        if current and current.get("runner") is done_task:
+            current["runner_done"] = True
+            current["last_updated_at"] = _runtime_state_iso_now()
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            _update_runtime_task_state(tid, status=current.get("status") or "stopped", finished_at=_runtime_state_iso_now())
+        except Exception as exc:
+            _update_runtime_task_state(tid, status="error", last_error=str(exc)[:200], finished_at=_runtime_state_iso_now())
+            print(f"[TASK] runner crashed for {tid}: {exc}")
+
+    runner.add_done_callback(_cleanup)
+
+
+def _seconds_since_task_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    try:
+        target_tz = CONFIG.get_timezone()
+    except Exception:
+        target_tz = timezone.utc
+    ts = value
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=target_tz)
+    now = CONFIG.now()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=target_tz)
+    try:
+        delta = (now.astimezone(target_tz) - ts.astimezone(target_tz)).total_seconds()
+    except Exception:
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        ts_naive = value if value.tzinfo is None else value.astimezone(timezone.utc).replace(tzinfo=None)
+        delta = (now_naive - ts_naive).total_seconds()
+    return max(0.0, float(delta))
+
+
+def _start_send_task_runner(
+    *,
+    task_id: str,
+    account: str,
+    group_ids: list[int],
+    message: str,
+    parse_mode: str,
+    disable_web_page_preview: bool,
+    delay_ms: int,
+    rounds: int,
+    round_interval_s: int,
+    start_delay: float = 0.0,
+    start_round_idx: int = 0,
+    start_group_idx: int = 0,
+    delay_scope: str = "per_account",
+) -> bool:
+    if _task_runner_active(task_id):
+        return False
+
+    runner = asyncio.create_task(
+        _run_send_task_with_delay(
+            task_id=task_id,
+            account=account,
+            group_ids=group_ids,
+            message=message,
+            parse_mode=parse_mode,
+            disable_web_page_preview=disable_web_page_preview,
+            delay_ms=delay_ms,
+            rounds=rounds,
+            round_interval_s=round_interval_s,
+            start_delay=start_delay,
+            start_round_idx=start_round_idx,
+            start_group_idx=start_group_idx,
+        )
+    )
+    _register_task_runner(
+        task_id,
+        runner,
+        {
+            "account": account,
+            "status": "running",
+            "started_at": _runtime_state_iso_now(),
+            "delay_scope": delay_scope,
+            "total": len(group_ids),
+            "success": 0,
+            "failed": 0,
+            "current_index": max(0, int(start_group_idx or 0)),
+            "rounds": int(rounds or 0),
+            "current_round": max(1, int(start_round_idx or 0) + 1),
+            "round_interval_s": int(round_interval_s or 0),
+        },
+    )
+    return True
+
+
+async def _resume_existing_task(t: Task, reason: str, start_delay: float = 0.0) -> bool:
+    if _task_runner_active(t.id):
+        return False
+    try:
+        gids = json.loads(t.group_ids_json or "[]")
+    except Exception:
+        gids = []
+    if not gids:
+        return False
+    started = _start_send_task_runner(
+        task_id=t.id,
+        account=t.account_name,
+        group_ids=gids,
+        message=t.message,
+        parse_mode=t.parse_mode,
+        disable_web_page_preview=bool(t.disable_web_page_preview),
+        delay_ms=t.delay_ms,
+        rounds=t.rounds or 1,
+        round_interval_s=t.round_interval_s or 0,
+        start_delay=max(0.0, float(start_delay or 0.0)),
+        start_round_idx=max(0, (t.current_round or 1) - 1),
+        start_group_idx=max(0, (t.current_index or 0)),
+        delay_scope=_normalize_delay_scope(getattr(t, "delay_scope", None), "per_account"),
+    )
+    if not started:
+        return False
+
+    with SessionLocal() as db:
+        fresh = db.query(Task).filter(Task.id == t.id).first()
+        if fresh and fresh.status == "running":
+            fresh.heartbeat_at = CONFIG.now()
+            db.add(TaskEvent(
+                task_id=t.id,
+                event="runner_started",
+                detail=reason,
+                meta_json=json.dumps(
+                    {
+                        "round": int(fresh.current_round or 1),
+                        "index": int(fresh.current_index or 0),
+                    },
+                    ensure_ascii=False,
+                ),
+            ))
+            try:
+                db.commit()
+            except DatabaseError as exc:
+                db.rollback()
+                _handle_task_db_error("resume_existing_task_commit", exc)
+    return True
 
 
 async def _handle_private_copy(account: str, event):
@@ -996,14 +1807,7 @@ async def _handle_private_copy(account: str, event):
         finally:
             session.close()
         accounts = list(CONFIG.ACCOUNTS.keys())
-        authorized = []
-        for acc in accounts:
-            try:
-                ok = await multi_manager.is_authorized(acc)
-            except Exception:
-                ok = False
-            if ok:
-                authorized.append(acc)
+        authorized, _skipped = await _split_authorized_accounts(accounts)
         for acc in authorized:
             try:
                 gids = []
@@ -1034,12 +1838,7 @@ async def _handle_private_copy(account: str, event):
                         except Exception as e:
                             err = str(e)
                             ok = False
-                        title = str(gid)
-                        try:
-                            ent = await multi_manager.get(acc).client.get_entity(gid)
-                            title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
-                        except Exception:
-                            title = str(gid)
+                        title = await multi_manager.get_group_title(acc, gid)
                         db.add(SendLog(
                             account_name=acc,
                             group_id=gid,
@@ -1082,17 +1881,15 @@ async def send_async(request: Request):
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
+    delay_scope = _normalize_delay_scope(body.get("delay_scope"), "per_account")
     rounds = max(1, int(body.get("rounds", 100)))
     round_interval_s = int(body.get("round_interval_s", 600))
     account = body.get("account") or CONFIG.DEFAULT_ACCOUNT
     request_id = body.get("request_id")
-    ok, reason = _check_request_guard(token, request_id)
+    ok, _reason = _check_request_guard(token, request_id)
     if not ok:
         return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
-    try:
-        authorized = await multi_manager.is_authorized(account)
-    except Exception:
-        authorized = False
+    authorized = await _is_authorized_account(account)
     if not authorized:
         return JSONResponse({"detail": "session_not_authorized"}, status_code=403)
     group_ids = unique_group_ids(group_ids)
@@ -1103,7 +1900,11 @@ async def send_async(request: Request):
     try:
         existing = _get_existing_tasks_by_request_id(db, request_id)
         if existing:
-            return JSONResponse({"task_id": existing[0].id, "duplicate": True})
+            return JSONResponse({
+                "task_id": existing[0].id,
+                "duplicate": True,
+                "delay_scope": _normalize_delay_scope(getattr(existing[0], "delay_scope", None), delay_scope),
+            })
         t = Task(
             id=task_id,
             status="running",
@@ -1115,6 +1916,7 @@ async def send_async(request: Request):
             parse_mode=parse_mode,
             disable_web_page_preview=1 if disable_web_page_preview else 0,
             delay_ms=delay_ms,
+            delay_scope=delay_scope,
             rounds=rounds,
             round_interval_s=round_interval_s,
             current_index=0,
@@ -1124,11 +1926,31 @@ async def send_async(request: Request):
         )
         db.add(t)
         db.add(TaskEvent(task_id=task_id, event="created", detail="task_created", meta_json=json.dumps({"count": len(group_ids)}, ensure_ascii=False)))
-        db.commit()
+        try:
+            db.commit()
+        except DatabaseError as exc:
+            db.rollback()
+            _handle_task_db_error("send_async_create", exc)
+            return JSONResponse({"detail": "task_db_unavailable"}, status_code=503)
+    except DatabaseError as exc:
+        db.rollback()
+        _handle_task_db_error("send_async_query", exc)
+        return JSONResponse({"detail": "task_db_unavailable"}, status_code=503)
     finally:
         db.close()
-    asyncio.create_task(_run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s))
-    return JSONResponse({"task_id": task_id})
+    _start_send_task_runner(
+        task_id=task_id,
+        account=account,
+        group_ids=group_ids,
+        message=message,
+        parse_mode=parse_mode,
+        disable_web_page_preview=disable_web_page_preview,
+        delay_ms=delay_ms,
+        rounds=rounds,
+        round_interval_s=round_interval_s,
+        delay_scope=delay_scope,
+    )
+    return JSONResponse({"task_id": task_id, "delay_scope": delay_scope})
 
 
 @app.route("/api/copy-receiver", methods=["POST"])
@@ -1200,27 +2022,37 @@ async def task_status(request: Request):
     try:
         t = db.query(Task).filter(Task.id == task_id).first()
         if not t:
+            fallback = _runtime_task_status_payload(task_id)
+            if fallback:
+                return JSONResponse(fallback)
             return JSONResponse({"detail": "Not Found"}, status_code=404)
-        # 计算当前轮次的进度
+        counters = _collect_task_log_counters(
+            db,
+            [t.id],
+            {t.id: int(t.current_round or 0)},
+            {t.id: t},
+        ).get(t.id, {})
+
+        success = int(counters.get("success", 0))
+        failed = int(counters.get("failed", 0))
+        overall_completed = int(counters.get("overall_completed", 0))
         current_round_planned = _planned_group_count(t.group_ids_json)
-        current_round_sent = min(max(0, int(t.current_index or 0)), current_round_planned)
-        current_round_completed = min(max(0, int(t.current_index or 0)), current_round_planned)
-        
-        # 计算累计进度（前面轮次 + 当前轮次）
-        total_sent_all_rounds = int((t.success or 0) + (t.failed or 0))
-        previous_rounds_sent = max(0, total_sent_all_rounds - current_round_sent)
-        
-        # 总体进度：前面轮次已完成 + 当前轮次计划数
+        current_round_completed = min(
+            max(0, int(counters.get("current_round_completed", 0))),
+            current_round_planned,
+        )
+        current_round_sent = current_round_completed
+        previous_rounds_sent = max(0, overall_completed - current_round_completed)
         overall_planned = previous_rounds_sent + current_round_planned
-        overall_completed = total_sent_all_rounds
-        
+
         data = {
             "task_id": t.id,
             "status": t.status,
             "total": t.total,
-            "success": t.success,
-            "failed": t.failed,
-            "current_index": t.current_index,
+            "delay_scope": _normalize_delay_scope(getattr(t, "delay_scope", None), "per_account"),
+            "success": success,
+            "failed": failed,
+            "current_index": current_round_completed,
             "current_round_planned": current_round_planned,
             "current_round_sent": current_round_sent,
             "current_round_completed": current_round_completed,
@@ -1228,13 +2060,20 @@ async def task_status(request: Request):
             "overall_planned": overall_planned,
             "overall_completed": overall_completed,
             "started_at": t.started_at.isoformat() if t.started_at else None,
-            "finished_at": t.finished_at.isoformat() if t.started_at else None,
+            "finished_at": t.finished_at.isoformat() if t.finished_at else None,
             "rounds": t.rounds,
             "current_round": t.current_round,
             "round_interval_s": t.round_interval_s,
             "next_round_at": t.next_round_at.isoformat() if t.next_round_at else None,
         }
         return JSONResponse(data)
+    except DatabaseError as exc:
+        db.rollback()
+        _handle_task_db_error("task_status", exc)
+        fallback = _runtime_task_status_payload(task_id)
+        if fallback:
+            return JSONResponse(fallback)
+        return JSONResponse({"detail": "task_db_unavailable"}, status_code=503)
     finally:
         db.close()
 
@@ -1251,47 +2090,77 @@ async def tasks_summary(request: Request):
             .limit(300)
             .all()
         )
-        acc_map: dict[str, dict] = {}
+        selected_tasks: dict[str, Task] = {}
         for t in rows:
             k = t.account_name
-            existing = acc_map.get(k)
+            existing = selected_tasks.get(k)
             current_ts = t.heartbeat_at or t.finished_at or t.started_at
             existing_ts = None
             if existing:
-                existing_ts = existing.get("_sort_ts")
+                existing_ts = existing.heartbeat_at or existing.finished_at or existing.started_at
 
             # Running tasks always win. Otherwise keep the most recent task
             # so the monitor panel can still show failed/stopped/done tasks.
             should_replace = False
             if not existing:
                 should_replace = True
-            elif existing.get("status") != "running" and t.status == "running":
+            elif existing.status != "running" and t.status == "running":
                 should_replace = True
-            elif existing.get("status") != "running" and t.status != "running":
+            elif existing.status != "running" and t.status != "running":
                 if current_ts and ((not existing_ts) or current_ts > existing_ts):
                     should_replace = True
 
             if not should_replace:
                 continue
+            selected_tasks[k] = t
 
+        current_round_by_task = {
+            t.id: int(t.current_round or 0)
+            for t in selected_tasks.values()
+            if t and t.id
+        }
+        counters_by_task = _collect_task_log_counters(
+            db,
+            list(current_round_by_task.keys()),
+            current_round_by_task,
+            {t.id: t for t in selected_tasks.values() if t and t.id},
+        )
+
+        data = []
+        for account, t in selected_tasks.items():
+            current_ts = t.heartbeat_at or t.finished_at or t.started_at
             round_total = _planned_group_count(t.group_ids_json)
-            round_completed = max(0, int(t.current_index or 0))
-            if round_total > 0:
-                round_completed = min(round_completed, round_total)
-
-            total_sent_all_rounds = int((t.success or 0) + (t.failed or 0))
-            previous_rounds_sent = max(0, total_sent_all_rounds - round_completed)
+            counters = counters_by_task.get(t.id, {})
+            round_completed = min(
+                max(0, int(counters.get("current_round_completed", 0))),
+                round_total,
+            )
+            overall_completed = int(counters.get("overall_completed", 0))
+            previous_rounds_sent = max(0, overall_completed - round_completed)
             overall_planned = previous_rounds_sent + round_total
-            overall_completed = total_sent_all_rounds
+            next_round_at = t.next_round_at.isoformat() if t.next_round_at else None
+            wait_seconds = 0
+            status = t.status
+            if t.status == "running" and round_total == 0:
+                status = "no_sendable_groups"
+            elif t.status == "running" and t.next_round_at:
+                target = t.next_round_at
+                now = CONFIG.now()
+                if target.tzinfo is None and now.tzinfo is not None:
+                    target = target.replace(tzinfo=now.tzinfo)
+                wait_seconds = max(0, int((target - now).total_seconds()))
+                if wait_seconds > 0 and round_total > 0 and round_completed >= round_total:
+                    status = "waiting_next_round"
 
-            acc_map[k] = {
-                "account": k,
-                "status": t.status,
+            data.append({
+                "account": account,
+                "status": status,
                 "task_id": t.id,
+                "delay_scope": _normalize_delay_scope(getattr(t, "delay_scope", None), "per_account"),
                 "tasks_count": 1,
                 "total": round_total,
-                "success": int(t.success or 0),
-                "failed": int(t.failed or 0),
+                "success": int(counters.get("success", 0)),
+                "failed": int(counters.get("failed", 0)),
                 "completed": round_completed,
                 "progress_total": round_total,
                 "progress_completed": round_completed,
@@ -1301,17 +2170,16 @@ async def tasks_summary(request: Request):
                 "current_round_sent": round_completed,
                 "overall_planned": overall_planned,
                 "overall_completed": overall_completed,
-                "last_updated_at": current_ts,
-                "_sort_ts": current_ts,
-            }
-        data = []
-        for _, e in acc_map.items():
-            if e.get("last_updated_at"):
-                e["last_updated_at"] = e["last_updated_at"].isoformat()
-            e.pop("_sort_ts", None)
-            data.append(e)
+                "next_round_at": next_round_at,
+                "wait_seconds": wait_seconds,
+                "last_updated_at": current_ts.isoformat() if current_ts else None,
+            })
         data.sort(key=lambda x: x.get("last_updated_at") or "", reverse=True)
         return JSONResponse(data)
+    except DatabaseError as exc:
+        db.rollback()
+        _handle_task_db_error("tasks_summary", exc)
+        return JSONResponse(_runtime_task_summary_rows())
     finally:
         db.close()
 
@@ -1332,6 +2200,7 @@ async def list_tasks(request: Request):
                 "failed": r.failed,
                 "current_index": r.current_index,
                 "account": r.account_name,
+                "delay_scope": _normalize_delay_scope(getattr(r, "delay_scope", None), "per_account"),
                 "started_at": r.started_at.isoformat() if r.started_at else None,
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "rounds": getattr(r, "rounds", None),
@@ -1341,6 +2210,10 @@ async def list_tasks(request: Request):
             for r in rows
         ]
         return JSONResponse(data)
+    except DatabaseError as exc:
+        db.rollback()
+        _handle_task_db_error("list_tasks", exc)
+        return JSONResponse(_runtime_task_list_rows())
     finally:
         db.close()
 
@@ -1430,6 +2303,65 @@ async def stop_all_tasks(request: Request):
         db.close()
 
 
+@app.route("/api/tasks/delete", methods=["POST"])
+async def delete_task(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
+    task_id = (body.get("task_id") or "").strip()
+    if not task_id:
+        return JSONResponse({"detail": "task_id required"}, status_code=400)
+    db: Session = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
+        events_deleted = (
+            db.query(TaskEvent)
+            .filter(TaskEvent.task_id == task_id)
+            .delete(synchronize_session=False)
+        )
+        db.delete(task)
+        db.commit()
+        return JSONResponse({
+            "ok": True,
+            "deleted_task_id": task_id,
+            "events_deleted": int(events_deleted or 0),
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/tasks/clear", methods=["POST"])
+async def clear_all_tasks(request: Request):
+    token = request.headers.get("X-Admin-Token")
+    if token != CONFIG.ADMIN_TOKEN:
+        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    db: Session = SessionLocal()
+    try:
+        task_ids = [row[0] for row in db.query(Task.id).all()]
+        events_deleted = 0
+        if task_ids:
+            events_deleted = (
+                db.query(TaskEvent)
+                .filter(TaskEvent.task_id.in_(task_ids))
+                .delete(synchronize_session=False)
+            )
+        tasks_deleted = db.query(Task).delete(synchronize_session=False)
+        db.commit()
+        return JSONResponse({
+            "ok": True,
+            "tasks_deleted": int(tasks_deleted or 0),
+            "events_deleted": int(events_deleted or 0),
+        })
+    finally:
+        db.close()
+
+
 async def _run_send_task_with_delay(
     task_id: str,
     account: str,
@@ -1446,16 +2378,19 @@ async def _run_send_task_with_delay(
 ):
     """带延迟启动的发送任务包装器"""
     if start_delay > 0:
+        _update_runtime_task_state(task_id, status="scheduled")
         print(f"[TASK] {account}: waiting {start_delay:.1f}s before starting...")
         if not await _sleep_with_task_checks(task_id, start_delay, refresh_heartbeat=True):
             return
     print(f"[TASK] {account}: starting send task (task_id={task_id[:8]}...)")
+    _update_runtime_task_state(task_id, status="running")
     await _run_send_task(task_id, account, group_ids, message, parse_mode, disable_web_page_preview, delay_ms, rounds, round_interval_s, start_round_idx, start_group_idx)
 
 
 async def _run_send_task(task_id: str, account: str, group_ids: list[int], message: str, parse_mode: str, disable_web_page_preview: bool, delay_ms: int, rounds: int, round_interval_s: int, start_round_idx: int = 0, start_group_idx: int = 0):
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = int(getattr(CONFIG, "MAX_CONSECUTIVE_FAILURES", 10))
+    active_group_ids = unique_group_ids(group_ids)
 
     def _should_defer_group(error_text: str | None) -> bool:
         if not error_text:
@@ -1483,6 +2418,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 t = db.query(Task).filter(Task.id == task_id).first()
                 if not t:
                     print(f"[TASK] {account}: Task record missing, terminating task loop")
+                    _update_runtime_task_state(task_id, status="stopped", finished_at=_runtime_state_iso_now())
                     return
                 else:
                     t.current_round = current_round
@@ -1494,20 +2430,37 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         # 新轮次开始，重置索引
                         t.current_index = 0
 
+                active_group_ids = _filter_account_banned_group_ids(db, account, active_group_ids)
+                if not active_group_ids:
+                    t.status = "completed"
+                    t.finished_at = CONFIG.now()
+                    t.next_round_at = None
+                    t.group_ids_json = "[]"
+                    db.add(TaskEvent(task_id=task_id, event="completed", detail="no_sendable_groups", meta_json=json.dumps({"account": account}, ensure_ascii=False)))
+                    db.commit()
+                    _update_runtime_task_state(task_id, status="completed", total=0, finished_at=_runtime_state_iso_now())
+                    return
+
                 if resume_current_round:
-                    ids = list(group_ids)
+                    ids = list(active_group_ids)
                 elif int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
-                    grades = classify_groups(db, account, group_ids)
+                    grades = classify_groups(db, account, active_group_ids)
                     role = classify_account(db, account)
-                    ids = select_groups_for_account(role, group_ids, grades)
+                    ids = select_groups_for_account(role, active_group_ids, grades)
                 else:
-                    ids = list(group_ids)
+                    ids = list(active_group_ids)
                     random.shuffle(ids)
                 ids = unique_group_ids(ids)
                 if not resume_current_round:
                     ids = sort_groups_for_account(db, account, ids)
                 t.group_ids_json = json.dumps(ids)
                 db.commit()
+            _update_runtime_task_state(
+                task_id,
+                status="running",
+                current_round=int(current_round),
+                total=len(ids),
+            )
             deferred_once: set[int] = set()
             
             # Resumption logic: skip groups if restarting in the middle of a round
@@ -1525,6 +2478,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             pos = start_pos
             while pos < len(ids):
                 gid = ids[pos]
+                task_delay_scope = "per_account"
                 # Use a fresh session for each message to avoid long-lived session issues
                 with SessionLocal() as db:
                     t = db.query(Task).filter(Task.id == task_id).first()
@@ -1532,6 +2486,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     # If task row has been deleted (e.g., system reset), terminate immediately
                     if not t:
                         print(f"[TASK] {account}: Task record deleted, stopping immediately")
+                        _update_runtime_task_state(task_id, status="stopped", finished_at=_runtime_state_iso_now())
                         return
                     
                     # Check stop/pause
@@ -1541,6 +2496,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         t.finished_at = CONFIG.now()
                         db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
                         db.commit()
+                        _update_runtime_task_state(task_id, status="stopped", finished_at=_runtime_state_iso_now())
                         return
 
                     while t and t.paused:
@@ -1559,7 +2515,15 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             t.finished_at = CONFIG.now()
                             db.add(TaskEvent(task_id=task_id, event="stopped", detail="task_stopped", meta_json=json.dumps({}, ensure_ascii=False)))
                             db.commit()
+                        _update_runtime_task_state(task_id, status="stopped", finished_at=_runtime_state_iso_now())
                         return
+
+                    task_delay_scope, task_delay_ms = _effective_task_timing(db, t, task_id, delay_ms)
+                    if task_delay_scope == "global":
+                        wait_ms = _compute_effective_task_delay_ms(account, task_delay_ms)
+                        bucket_key = _global_send_bucket_key(t, task_id)
+                        if not await _reserve_global_send_slot(task_id, bucket_key, wait_ms / 1000.0):
+                            return
 
                     # Send Logic
                     send_text = message
@@ -1581,14 +2545,11 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     if not ok:
                         print(f"[TASK] {account}: Failed to send to {gid}: {err}")
                     preview = message[:200]
-                    title = str(gid)
-                    try:
-                        ent = await multi_manager.get(account).client.get_entity(gid)
-                        title = getattr(ent, 'title', None) or getattr(ent, 'username', None) or getattr(ent, 'first_name', None) or str(gid)
-                    except Exception:
-                        title = str(gid)
+                    title = await multi_manager.get_group_title(account, gid)
 
                     log = SendLog(
+                        task_id=task_id,
+                        task_round=current_round,
                         account_name=account,
                         group_id=gid,
                         group_title=title,
@@ -1604,6 +2565,7 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     t = db.query(Task).filter(Task.id == task_id).first()
                     if t:
                         finalized = False
+                        advance_pos = True
                         if ok:
                             t.success = (t.success or 0) + 1
                             consecutive_failures = 0
@@ -1612,9 +2574,19 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             consecutive_failures += 1
                             if should_add_to_blist(err):
                                 try:
-                                    add_banned_group(db, account, gid)
+                                    add_banned_group(db, account, gid, global_scope=should_add_to_global_blist(err))
                                 except Exception:
                                     pass
+                                active_group_ids = _remove_group_id_once(active_group_ids, gid)
+                                ids.pop(pos)
+                                t.group_ids_json = json.dumps(ids)
+                                advance_pos = False
+                                db.add(TaskEvent(
+                                    task_id=task_id,
+                                    event="skip",
+                                    detail="group_blocked_for_account",
+                                    meta_json=json.dumps({"gid": gid, "error": err, "account": account}, ensure_ascii=False),
+                                ))
                             if gid not in deferred_once and _should_defer_group(err):
                                 deferred_once.add(gid)
                                 ids.pop(pos)
@@ -1632,7 +2604,8 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
 
                         if finalized:
                             t.current_index = (t.current_index or 0) + 1
-                            pos += 1
+                            if advance_pos:
+                                pos += 1
                         t.heartbeat_at = CONFIG.now()
                         # 获取当前轮次的实际计划数
                         current_round_planned = _planned_group_count(t.group_ids_json)
@@ -1643,6 +2616,15 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         # 总体进度：前面轮次累计 + 当前轮次实际计划数
                         overall_total = previous_rounds_completed + current_round_planned
                         overall_completed = previous_rounds_completed + current_round_completed
+                        _update_runtime_task_state(
+                            task_id,
+                            status="running",
+                            success=int(t.success or 0),
+                            failed=int(t.failed or 0),
+                            current_index=int(t.current_index or 0),
+                            current_round=int(t.current_round or current_round),
+                            total=int(current_round_planned or len(ids)),
+                        )
                         db.add(TaskEvent(task_id=task_id, event="progress", detail=f"{overall_completed}/{overall_total}", meta_json=json.dumps({"gid": gid, "round": t.current_round, "round_completed": current_round_completed, "round_planned": current_round_planned}, ensure_ascii=False)))
                     
                     # Auto-pause logic
@@ -1654,7 +2636,18 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                             meta_json=json.dumps({"consecutive_failures": consecutive_failures, "last_error": err}, ensure_ascii=False)
                         ))
                     
-                    db.commit()
+                    try:
+                        db.commit()
+                    except DatabaseError as exc:
+                        db.rollback()
+                        _handle_task_db_error("task_runner_commit", exc)
+                        _update_runtime_task_state(
+                            task_id,
+                            status="error",
+                            last_error=f"task_db_write_error: {str(exc)[:160]}",
+                            finished_at=_runtime_state_iso_now(),
+                        )
+                        return
                 
                 # Handle auto-pause outside of DB session
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -1664,22 +2657,35 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                     continue
 
                 # Sleep between messages
-                if int(getattr(CONFIG, "SMART_SCHEDULER_ENABLED", 1)) == 1:
-                    with SessionLocal() as db:
-                        rate = recent_fail_rate(db, account, int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50)))
-                    base_ms = dynamic_delay_ms(delay_ms, rate)
-                    jitter_pct = float(getattr(CONFIG, "SEND_JITTER_PCT", 0.15))
-                    jitter = random.uniform(-jitter_pct, jitter_pct) * base_ms
-                    wait_ms = max(0, base_ms + jitter)
-                    if not await _sleep_with_task_checks(task_id, wait_ms / 1000.0, refresh_heartbeat=True):
-                        return
-                else:
-                    d = max(delay_ms, 0) / 1000.0
-                    if d > 0:
-                        if not await _sleep_with_task_checks(task_id, d, refresh_heartbeat=True):
+                if task_delay_scope != "global":
+                    wait_ms = _compute_effective_task_delay_ms(account, task_delay_ms)
+                    if wait_ms > 0:
+                        if not await _sleep_with_task_checks(task_id, wait_ms / 1000.0, refresh_heartbeat=True):
                             return
 
             # --- End of Round ---
+            if not active_group_ids:
+                with SessionLocal() as db:
+                    t = db.query(Task).filter(Task.id == task_id).first()
+                    if t:
+                        t.status = "completed"
+                        t.finished_at = CONFIG.now()
+                        t.next_round_at = None
+                        t.group_ids_json = "[]"
+                        db.add(TaskEvent(
+                            task_id=task_id,
+                            event="completed",
+                            detail="no_sendable_groups",
+                            meta_json=json.dumps({"account": account, "round": current_round}, ensure_ascii=False),
+                        ))
+                        try:
+                            db.commit()
+                        except DatabaseError as exc:
+                            db.rollback()
+                            _handle_task_db_error("task_complete_no_groups", exc)
+                _update_runtime_task_state(task_id, status="completed", total=0, finished_at=_runtime_state_iso_now(), next_round_at=None)
+                return
+
             if current_round < rounds:
                 sleep_time = round_interval_s
                 update_db_time = True
@@ -1715,9 +2721,15 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                         t = db.query(Task).filter(Task.id == task_id).first()
                         if t:
                             t.next_round_at = CONFIG.now() + timedelta(seconds=round_interval_s)
-                            db.commit()
+                            try:
+                                db.commit()
+                            except DatabaseError as exc:
+                                db.rollback()
+                                _handle_task_db_error("task_runner_next_round_commit", exc)
+                                _update_runtime_task_state(task_id, next_round_at=t.next_round_at.isoformat() if t.next_round_at else None)
                 
                 if sleep_time > 0:
+                    _update_runtime_task_state(task_id, next_round_at=(CONFIG.now() + timedelta(seconds=sleep_time)).isoformat())
                     if not await _sleep_with_task_checks(task_id, sleep_time, refresh_heartbeat=True):
                         return
 
@@ -1728,9 +2740,15 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
                 t.status = "done"
                 t.finished_at = CONFIG.now()
                 db.add(TaskEvent(task_id=task_id, event="finished", detail="task_done", meta_json=json.dumps({}, ensure_ascii=False)))
-                db.commit()
+                try:
+                    db.commit()
+                except DatabaseError as exc:
+                    db.rollback()
+                    _handle_task_db_error("task_runner_finish_commit", exc)
+        _update_runtime_task_state(task_id, status="done", finished_at=_runtime_state_iso_now())
 
     except Exception as e:
+        _update_runtime_task_state(task_id, status="error", last_error=str(e)[:200], finished_at=_runtime_state_iso_now())
         try:
             with SessionLocal() as db:
                 t = db.query(Task).filter(Task.id == task_id).first()
@@ -1861,8 +2879,7 @@ async def account_status(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     account = request.query_params.get("account") or CONFIG.DEFAULT_ACCOUNT
     try:
-        authorized = await multi_manager.is_authorized(account)
-        return JSONResponse({"authorized": authorized})
+        return JSONResponse({"authorized": await _is_authorized_account(account)})
     except Exception as e:
         return JSONResponse({"authorized": False, "detail": str(e)})
 
@@ -1939,10 +2956,11 @@ async def send_multi_account(request: Request):
         "parse_mode": "plain|markdown|html",
         "disable_web_page_preview": true,
         "delay_ms": 11000,  // 默认 11 秒
+        "delay_scope": "per_account",  // 批量群发默认每个账号各自发送
         "rounds": 100,
         "round_interval_s": 600,
-        "stagger_min_s": 120,  // 账号启动间隔最小秒数
-        "stagger_max_s": 300   // 账号启动间隔最大秒数
+        "stagger_min_s": 0,  // 账号启动间隔最小秒数
+        "stagger_max_s": 1   // 账号启动间隔最大秒数
     }
     """
     token = request.headers.get("X-Admin-Token")
@@ -1950,66 +2968,35 @@ async def send_multi_account(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
     
     body = await request.json()
+    strategy = str(body.get("strategy") or "full_broadcast_per_account").strip().lower()
     group_ids = body.get("group_ids") or []
+    distribution_map = body.get("distribution_map") or {}
     message = (body.get("message") or "").strip()
     parse_mode = body.get("parse_mode") or "plain"
     disable_web_page_preview = bool(body.get("disable_web_page_preview", True))
     delay_ms = int(body.get("delay_ms", 11000))  # 默认 11 秒
     delay_ms = max(delay_ms, getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500))
+    delay_scope = _normalize_delay_scope(body.get("delay_scope"), "per_account")
     rounds = max(1, int(body.get("rounds", 100)))
     round_interval_s = int(body.get("round_interval_s", 600))
-    # 错开延迟：默认 10-30 秒，防风控但不会等太久
-    stagger_min_s = float(body.get("stagger_min_s", 10))
-    stagger_max_s = float(body.get("stagger_max_s", 30))
+    # ponytail: 保留极小错峰，避免所有账号同一瞬间起跑。
+    stagger_min_s = float(body.get("stagger_min_s", 0))
+    stagger_max_s = float(body.get("stagger_max_s", 1))
     request_id = body.get("request_id")
     
     # 防重复请求
-    ok, reason = _check_request_guard(token, request_id)
+    ok, _reason = _check_request_guard(token, request_id)
     if not ok:
         return JSONResponse({"detail": "Too Many Requests"}, status_code=429, headers={"Retry-After": "1"})
     
-    group_ids = unique_group_ids(group_ids)
-    if not group_ids or not message:
-        return JSONResponse({"detail": "group_ids and message required"}, status_code=400)
+    if not message:
+        return JSONResponse({"detail": "message required"}, status_code=400)
     
     # 获取账号列表
-    accounts = body.get("accounts") or []
-    if not accounts:
-        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
-        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
-        session_dir = CONFIG.SESSION_DIR
-        for i in range(1, count + 1):
-            name = f"{prefix}_{i:02d}"
-            session_path = os.path.join(session_dir, f"{name}.session")
-            if os.path.exists(session_path):
-                accounts.append(name)
-        for name in _discover_session_accounts():
-            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
-                accounts.append(name)
-    
+    accounts = _candidate_accounts(body.get("accounts") or [])
     if not accounts:
         return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
-
-    unique_accounts = []
-    seen_accounts = set()
-    for acc in accounts:
-        name = str(acc or "").strip()
-        if not name or name in seen_accounts:
-            continue
-        seen_accounts.add(name)
-        unique_accounts.append(name)
-
-    authorized_accounts = []
-    skipped_unauthorized_accounts = []
-    for acc in unique_accounts:
-        try:
-            authorized = await multi_manager.is_authorized(acc)
-        except Exception:
-            authorized = False
-        if authorized:
-            authorized_accounts.append(acc)
-        else:
-            skipped_unauthorized_accounts.append(acc)
+    authorized_accounts, skipped_unauthorized_accounts = await _split_authorized_accounts(accounts)
 
     if not authorized_accounts:
         return JSONResponse({
@@ -2018,11 +3005,28 @@ async def send_multi_account(request: Request):
         }, status_code=403)
     accounts = authorized_accounts
     
-    # 批量群发默认应让每个账号都发送完整的所选群组列表。
-    # 之前这里按账号对群组做了唯一分摊，导致用户选了 100+ 个群后，
-    # 每个账号只拿到十几个群，表现成“跑了两轮却只有 20 多条成功记录”。
-    full_group_ids = unique_group_ids(group_ids)
-    planned_distribution = {acc: list(full_group_ids) for acc in accounts}
+    if strategy == "distributed_join_only":
+        if not isinstance(distribution_map, dict):
+            return JSONResponse({"detail": "distribution_map required"}, status_code=400)
+        planned_distribution = {
+            acc: unique_group_ids(distribution_map.get(acc) or [])
+            for acc in accounts
+        }
+        full_group_ids = unique_group_ids([
+            gid
+            for gids in planned_distribution.values()
+            for gid in gids
+        ])
+        if not full_group_ids:
+            return JSONResponse({"detail": "no_groups_available_for_distributed_join_mode"}, status_code=400)
+    else:
+        # 批量群发默认应让每个账号都发送完整的所选群组列表。
+        # 之前这里按账号对群组做了唯一分摊，导致用户选了 100+ 个群后，
+        # 每个账号只拿到十几个群，表现成“跑了两轮却只有 20 多条成功记录”。
+        full_group_ids = unique_group_ids(group_ids)
+        if not full_group_ids:
+            return JSONResponse({"detail": "group_ids required"}, status_code=400)
+        planned_distribution = {acc: list(full_group_ids) for acc in accounts}
 
     # 为每个账号创建单独任务，每个账号都拿到完整群组列表
     task_ids = []
@@ -2046,7 +3050,8 @@ async def send_multi_account(request: Request):
                 "accounts_count": len(existing_tasks),
                 "planned_groups": sum(len(it["group_ids"]) for it in existing_tasks),
                 "unique_groups": len(full_group_ids),
-                "strategy": "full_broadcast_per_account",
+                "strategy": strategy,
+                "delay_scope": delay_scope,
                 "duplicate": True,
                 "stagger_min_s": stagger_min_s,
                 "stagger_max_s": stagger_max_s,
@@ -2068,6 +3073,7 @@ async def send_multi_account(request: Request):
                 parse_mode=parse_mode,
                 disable_web_page_preview=1 if disable_web_page_preview else 0,
                 delay_ms=delay_ms,
+                delay_scope=delay_scope,
                 rounds=rounds,
                 round_interval_s=round_interval_s,
                 current_index=0,
@@ -2083,7 +3089,16 @@ async def send_multi_account(request: Request):
                 meta_json=json.dumps({"count": len(acc_group_ids)}, ensure_ascii=False)
             ))
             task_ids.append({"account": acc, "task_id": task_id, "group_ids": acc_group_ids})
-        db.commit()
+        try:
+            db.commit()
+        except DatabaseError as exc:
+            db.rollback()
+            _handle_task_db_error("send_async_batch_create", exc)
+            return JSONResponse({"detail": "task_db_unavailable"}, status_code=503)
+    except DatabaseError as exc:
+        db.rollback()
+        _handle_task_db_error("send_async_batch_query", exc)
+        return JSONResponse({"detail": "task_db_unavailable"}, status_code=503)
     finally:
         db.close()
 
@@ -2118,7 +3133,7 @@ async def send_multi_account(request: Request):
                     elif it["role"] == "RISK":
                         factor = 1.6
                     cumulative_delay += random.uniform(stagger_min_s, stagger_max_s) * factor
-                asyncio.create_task(_run_send_task_with_delay(
+                _start_send_task_runner(
                     task_id=it["task_id"],
                     account=it["account"],
                     group_ids=it["group_ids"],
@@ -2129,7 +3144,8 @@ async def send_multi_account(request: Request):
                     rounds=rounds,
                     round_interval_s=round_interval_s,
                     start_delay=cumulative_delay,
-                ))
+                    delay_scope=delay_scope,
+                )
         finally:
             db2.close()
     else:
@@ -2137,7 +3153,7 @@ async def send_multi_account(request: Request):
         for i, item in enumerate(task_ids):
             if i > 0:
                 cumulative_delay += random.uniform(stagger_min_s, stagger_max_s)
-            asyncio.create_task(_run_send_task_with_delay(
+            _start_send_task_runner(
                 task_id=item["task_id"],
                 account=item["account"],
                 group_ids=item["group_ids"],
@@ -2148,14 +3164,16 @@ async def send_multi_account(request: Request):
                 rounds=rounds,
                 round_interval_s=round_interval_s,
                 start_delay=cumulative_delay,
-            ))
+                delay_scope=delay_scope,
+            )
     
     return JSONResponse({
         "tasks": task_ids,
         "accounts_count": len(accounts),
         "planned_groups": sum(len(it["group_ids"]) for it in task_ids),
         "unique_groups": len(full_group_ids),
-        "strategy": "full_broadcast_per_account",
+        "strategy": strategy,
+        "delay_scope": delay_scope,
         "stagger_min_s": stagger_min_s,
         "stagger_max_s": stagger_max_s,
         "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
@@ -2185,11 +3203,8 @@ async def join_group(request: Request):
         return JSONResponse({"detail": "invite_link required"}, status_code=400)
     
     try:
-        # 检查账号是否已授权
-        authorized = await multi_manager.is_authorized(account)
-        if not authorized:
+        if not await _is_authorized_account(account):
             return JSONResponse({"detail": "account_not_authorized"}, status_code=403)
-        
         result = await multi_manager.join_group(account, invite_link)
         return JSONResponse({"account": account, **result})
     except Exception as e:
@@ -2220,32 +3235,12 @@ async def join_groups_batch(request: Request):
         return JSONResponse({"detail": "invite_links required"}, status_code=400)
     
     # 获取账号列表
-    accounts = body.get("accounts") or []
-    if not accounts:
-        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
-        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
-        session_dir = CONFIG.SESSION_DIR
-        for i in range(1, count + 1):
-            name = f"{prefix}_{i:02d}"
-            session_path = os.path.join(session_dir, f"{name}.session")
-            if os.path.exists(session_path):
-                accounts.append(name)
-        for name in _discover_session_accounts():
-            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
-                accounts.append(name)
-    
+    accounts = _candidate_accounts(body.get("accounts") or [])
     if not accounts:
         return JSONResponse({"detail": "no_accounts_available"}, status_code=400)
     
     # 验证账号授权状态
-    authorized_accounts = []
-    for acc in accounts:
-        try:
-            if await multi_manager.is_authorized(acc):
-                authorized_accounts.append(acc)
-        except:
-            pass
-    
+    authorized_accounts, _skipped_accounts = await _split_authorized_accounts(accounts)
     if not authorized_accounts:
         return JSONResponse({"detail": "no_authorized_accounts"}, status_code=400)
     
@@ -2314,28 +3309,15 @@ async def join_group_all_accounts(request: Request):
         return JSONResponse({"detail": "invite_link required"}, status_code=400)
     
     # 获取账号列表
-    accounts = body.get("accounts") or []
-    if not accounts:
-        count = getattr(CONFIG, "ACCOUNT_COUNT", 100)
-        prefix = getattr(CONFIG, "ACCOUNT_PREFIX", "account")
-        session_dir = CONFIG.SESSION_DIR
-        
-        for i in range(1, count + 1):
-            name = f"{prefix}_{i:02d}"
-            session_path = os.path.join(session_dir, f"{name}.session")
-            if os.path.exists(session_path):
-                accounts.append(name)
-        for name in _discover_session_accounts():
-            if name not in accounts and os.path.exists(os.path.join(session_dir, f"{name}.session")):
-                accounts.append(name)
+    accounts = _candidate_accounts(body.get("accounts") or [])
     
     results = []
+    _authorized_accounts, unauthorized_accounts = await _split_authorized_accounts(accounts)
+    unauthorized_set = set(unauthorized_accounts)
     
     for i, acc in enumerate(accounts):
         try:
-            # 先检查授权
-            authorized = await multi_manager.is_authorized(acc)
-            if not authorized:
+            if acc in unauthorized_set:
                 results.append({"account": acc, "ok": False, "error": "not_authorized"})
                 continue
             
