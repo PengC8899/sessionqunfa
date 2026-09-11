@@ -81,7 +81,7 @@ async def bulk_update_profile(request: Request):
     
     try:
         form = await request.form()
-        first_name = form.get("first_name")
+        first_name = (form.get("first_name") or "").strip()
         last_name = form.get("last_name") or ""
         
         # Handle file upload
@@ -89,7 +89,7 @@ async def bulk_update_profile(request: Request):
         photo_path = None
         
         if photo_file and getattr(photo_file, "filename", None):
-            upload_dir = "/app/data/profile_uploads"
+            upload_dir = os.path.join(CONFIG.SESSION_DIR, "_profile_uploads")
             if not os.path.exists(upload_dir):
                 os.makedirs(upload_dir, exist_ok=True)
 
@@ -111,12 +111,20 @@ async def bulk_update_profile(request: Request):
         accounts = [os.path.basename(f)[:-8] for f in files]
         
         results = {}
-        for account in accounts:
-            try:
-                res = await multi_manager.update_profile(account, first_name, last_name, photo_path)
-                results[account] = {"ok": True, "details": res}
-            except Exception as e:
-                results[account] = {"ok": False, "error": str(e)}
+        try:
+            for account in accounts:
+                try:
+                    res = await multi_manager.update_profile(account, first_name, last_name, photo_path)
+                    results[account] = {"ok": True, "details": res}
+                except Exception as e:
+                    results[account] = {"ok": False, "error": str(e)}
+        finally:
+            # 清理上传的临时头像文件，避免磁盘泄漏
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    os.remove(photo_path)
+                except Exception:
+                    pass
                 
         return JSONResponse(results)
         

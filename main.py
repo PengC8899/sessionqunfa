@@ -64,6 +64,7 @@ import uuid
 import asyncio
 import os
 import random
+import shutil
 import logging
 import io
 import zipfile
@@ -264,8 +265,6 @@ async def list_accounts_status(request: Request):
 
     data = await asyncio.gather(*(inspect_one(name) for name in names))
     return JSONResponse(data)
-
-app.add_route("/api/accounts/bulk-update-profile", bulk_update_profile, methods=["POST"])
 
 
 @app.route("/api/accounts/authorized-list")
@@ -554,7 +553,7 @@ async def task_control(request: Request):
     except Exception:
         return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
     task_id = body.get("task_id")
-    action = body.get("action")
+    action = (body.get("action") or "").strip().lower()
     if not task_id or action not in ("pause", "resume", "stop"):
         return JSONResponse({"detail": "bad_request"}, status_code=400)
     db: Session = SessionLocal()
@@ -971,7 +970,7 @@ async def startup_event():
                 _src = _os.path.join(".", _sn + ".session")
                 if _os.path.exists(_src):
                     try:
-                        _shutil.copy2(_src, _target)
+                        shutil.copy2(_src, _target)
                     except Exception:
                         pass
     except Exception:
@@ -1253,16 +1252,24 @@ def _global_send_bucket_key(task: Task | None, task_id: str) -> str:
 
 
 async def _reserve_global_send_slot(task_id: str, bucket_key: str, wait_s: float) -> bool:
+    """在全局发送 bucket 上预留一个槽位，并等待到槽位到期再返回。
+
+    每次调用都会把 bucket 的“下次可用时间”往后推 wait_s，并真实等待到
+    自己这轮槽位到期，从而保证同一个 bucket（同一个 request/task）内相邻
+    两次发送之间有至少 wait_s 的间隔，真正起到防风控作用。
+    """
     delay_s = max(0.0, float(wait_s))
-    while True:
-        async with _GLOBAL_SEND_SLOT_LOCK:
-            now = time.monotonic()
-            remaining = _GLOBAL_SEND_NEXT_AT_BY_BUCKET.get(bucket_key, 0.0) - now
-            if remaining <= 0:
-                _GLOBAL_SEND_NEXT_AT_BY_BUCKET[bucket_key] = now + delay_s
-                return True
-        if not await _sleep_with_task_checks(task_id, remaining, refresh_heartbeat=True):
+    async with _GLOBAL_SEND_SLOT_LOCK:
+        now = time.monotonic()
+        last_at = _GLOBAL_SEND_NEXT_AT_BY_BUCKET.get(bucket_key, 0.0)
+        ready_at = max(now, last_at)
+        _GLOBAL_SEND_NEXT_AT_BY_BUCKET[bucket_key] = ready_at + delay_s
+    wait_needed_s = ready_at - now
+    if wait_needed_s > 0:
+        # 等待期间保持心跳，并响应暂停/停止请求
+        if not await _sleep_with_task_checks(task_id, wait_needed_s, refresh_heartbeat=True):
             return False
+    return True
 
 
 def _get_existing_tasks_by_request_id(db: Session, request_id: str | None) -> list[Task]:
@@ -2246,38 +2253,6 @@ async def task_events(request: Request):
     finally:
         db.close()
 
-@app.route("/api/task-control", methods=["POST"])
-async def task_control(request: Request):
-    token = request.headers.get("X-Admin-Token")
-    if token != CONFIG.ADMIN_TOKEN:
-        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"detail": "Invalid JSON"}, status_code=400)
-    task_id = body.get("task_id")
-    action = (body.get("action") or "").strip().lower()
-    if not task_id or action not in ("pause", "resume", "stop"):
-        return JSONResponse({"detail": "bad_request"}, status_code=400)
-    db: Session = SessionLocal()
-    try:
-        t = db.query(Task).filter(Task.id == task_id).first()
-        if not t:
-            return JSONResponse({"detail": "Not Found"}, status_code=404)
-        if action == "pause":
-            t.paused = 1
-            db.add(TaskEvent(task_id=task_id, event="paused", detail="task_paused", meta_json=json.dumps({}, ensure_ascii=False)))
-        elif action == "resume":
-            t.paused = 0
-            db.add(TaskEvent(task_id=task_id, event="resumed", detail="task_resumed", meta_json=json.dumps({}, ensure_ascii=False)))
-        elif action == "stop":
-            t.stop_requested = 1
-            db.add(TaskEvent(task_id=task_id, event="stop_requested", detail="task_stop_requested", meta_json=json.dumps({}, ensure_ascii=False)))
-        db.commit()
-        return JSONResponse({"ok": True})
-    finally:
-        db.close()
-
 @app.route("/api/tasks/stop-all", methods=["POST"])
 async def stop_all_tasks(request: Request):
     token = request.headers.get("X-Admin-Token")
@@ -2463,14 +2438,37 @@ async def _run_send_task(task_id: str, account: str, group_ids: list[int], messa
             )
             deferred_once: set[int] = set()
             
-            # Resumption logic: skip groups if restarting in the middle of a round
+            # Resumption logic: derive the real resume point from send_logs.
+            # Because deferred/blacklisted groups reorder the working list during
+            # a round, the persisted current_index no longer matches the array
+            # position. So on resume we skip any group that already has a
+            # "success" SendLog for this round and continue from the first one
+            # that does not, avoiding duplicate sends and skipped groups.
             start_pos = 0
             if i == start_round_idx and start_group_idx > 0:
                 print(f"[TASK] {account}: Resuming round {current_round} from index {start_group_idx}")
-                if start_group_idx < len(ids):
-                    start_pos = start_group_idx
-                else:
+                if not ids:
                     ids = []
+                else:
+                    with SessionLocal() as db:
+                        sent_success_in_round = {
+                            row[0]
+                            for row in db.query(SendLog.group_id)
+                            .filter(
+                                SendLog.task_id == task_id,
+                                SendLog.task_round == current_round,
+                                SendLog.status == "success",
+                            )
+                            .all()
+                        }
+                    start_pos = next(
+                        (pos for pos, gid in enumerate(ids) if gid not in sent_success_in_round),
+                        len(ids),
+                    )
+                    if start_pos >= len(ids):
+                        # 本轮所有群都已成功发送，直接结束当前轮
+                        ids = []
+                        start_pos = 0
             
             print(f"[TASK] {account}: Processing round {current_round}, {max(0, len(ids) - start_pos)} groups remaining")
 
@@ -3028,8 +3026,9 @@ async def send_multi_account(request: Request):
             return JSONResponse({"detail": "group_ids required"}, status_code=400)
         planned_distribution = {acc: list(full_group_ids) for acc in accounts}
 
-    # 为每个账号创建单独任务，每个账号都拿到完整群组列表
+    # 为每个账号创建单独任务；提前过滤账号级禁发群，避免创建“空气任务”。
     task_ids = []
+    skipped_no_sendable_accounts: list[str] = []
     db: Session = SessionLocal()
     try:
         existing = _get_existing_tasks_by_request_id(db, request_id)
@@ -3056,7 +3055,32 @@ async def send_multi_account(request: Request):
                 "stagger_min_s": stagger_min_s,
                 "stagger_max_s": stagger_max_s,
                 "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
+                "skipped_no_sendable_accounts": skipped_no_sendable_accounts,
             })
+        filtered_distribution: dict[str, list[int]] = {}
+        for acc in accounts:
+            acc_group_ids = _filter_account_banned_group_ids(
+                db,
+                acc,
+                unique_group_ids(planned_distribution.get(acc) or []),
+            )
+            if not acc_group_ids:
+                skipped_no_sendable_accounts.append(acc)
+                continue
+            filtered_distribution[acc] = acc_group_ids
+        if not filtered_distribution:
+            return JSONResponse({
+                "detail": "no_sendable_groups_for_accounts",
+                "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
+                "skipped_no_sendable_accounts": skipped_no_sendable_accounts,
+            }, status_code=400)
+        planned_distribution = filtered_distribution
+        accounts = list(filtered_distribution.keys())
+        full_group_ids = unique_group_ids([
+            gid
+            for gids in planned_distribution.values()
+            for gid in gids
+        ])
         for acc in accounts:
             acc_group_ids = planned_distribution.get(acc, [])
             if not acc_group_ids:
@@ -3169,7 +3193,8 @@ async def send_multi_account(request: Request):
     
     return JSONResponse({
         "tasks": task_ids,
-        "accounts_count": len(accounts),
+        "accounts_count": len(task_ids),
+        "requested_accounts_count": len(accounts) + len(skipped_no_sendable_accounts),
         "planned_groups": sum(len(it["group_ids"]) for it in task_ids),
         "unique_groups": len(full_group_ids),
         "strategy": strategy,
@@ -3177,6 +3202,7 @@ async def send_multi_account(request: Request):
         "stagger_min_s": stagger_min_s,
         "stagger_max_s": stagger_max_s,
         "skipped_unauthorized_accounts": skipped_unauthorized_accounts,
+        "skipped_no_sendable_accounts": skipped_no_sendable_accounts,
     })
 
 

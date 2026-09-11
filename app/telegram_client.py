@@ -901,17 +901,20 @@ F2F
         
         results = {}
         
-        # 1. 更新名称
-        try:
-            await self.client(UpdateProfileRequest(
-                first_name=first_name,
-                last_name=last_name
-            ))
-            results["name"] = True
-        except Exception as e:
-            print(f"[ERROR] Failed to update name for {self.session_name}: {e}")
-            results["name"] = False
-            results["name_error"] = str(e)
+        # 1. 更新名称（仅在提供了 name 时更新，避免 first_name=None 时 Telethon 报错）
+        if first_name:
+            try:
+                await self.client(UpdateProfileRequest(
+                    first_name=first_name,
+                    last_name=last_name
+                ))
+                results["name"] = True
+            except Exception as e:
+                print(f"[ERROR] Failed to update name for {self.session_name}: {e}")
+                results["name"] = False
+                results["name_error"] = str(e)
+        else:
+            results["name"] = "skipped"
             
         # 2. 更新头像
         if photo_path and os.path.exists(photo_path):

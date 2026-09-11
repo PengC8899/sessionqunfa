@@ -1,6 +1,5 @@
 import random
 import re
-import time
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from app.models import SendLog
@@ -52,9 +51,11 @@ class SendScheduler:
         return {"WHITE": white, "GREY": grey, "BLACK": black}
 
     def account_role(self, account: str) -> str:
-        window = int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW", 40))
-        safe_rate = float(getattr(CONFIG, "ACCOUNT_SAFE_FAIL_RATE", 0.15))
-        risk_rate = float(getattr(CONFIG, "ACCOUNT_RISK_FAIL_RATE", 0.35))
+        # 与 dispatch_layer.classify_account 保持一致，避免同一账号在两套
+        # 发送路径下被判定为不同角色，导致群选择策略不一致。
+        window = int(getattr(CONFIG, "ACCOUNT_RECENT_WINDOW_N", 50))
+        safe_rate = float(getattr(CONFIG, "ACCOUNT_SAFE_MAX_FAIL_RATE", 0.2))
+        risk_rate = float(getattr(CONFIG, "ACCOUNT_RISK_MIN_FAIL_RATE", 0.5))
         rows = (
             self.db.query(SendLog)
             .filter(SendLog.account_name == account)

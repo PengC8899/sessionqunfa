@@ -2,10 +2,9 @@ import asyncio
 import time
 import hashlib
 import random
-import json
 from sqlalchemy.orm import Session
 from app.telegram_client import MultiTelegramManager
-from app.models import SendLog, Task, TaskEvent
+from app.models import SendLog
 from app.config import CONFIG
 from app.services.send_scheduler import SendScheduler
 from app.services.group_service import get_banned_group_ids, add_banned_group, should_exclude_group_on_error, should_add_to_global_blist
@@ -70,7 +69,7 @@ async def send_to_groups(
     min_delay_ms = max(getattr(CONFIG, "SEND_MIN_DELAY_MS", 1500), 0)
     jitter_pct = max(0.0, min(getattr(CONFIG, "SEND_JITTER_PCT", 0.15), 0.5))
     base = max(base_delay_ms, min_delay_ms)
-    for idx, gid in enumerate(ids):
+    for gid in ids:
         skipped = _should_skip(account, gid, message, parse_mode, disable_web_page_preview)
         msg_id = None
         err = None
@@ -99,6 +98,8 @@ async def send_to_groups(
                 db.commit()
                 continue
             attempt = 0
+            flood_retry = 0
+            max_flood_retry = max(int(getattr(CONFIG, "MAX_FLOOD_RETRY", 5)), 0)
             ok = False
             while attempt <= max(0, retry_max):
                 send_text = message
@@ -126,6 +127,11 @@ async def send_to_groups(
                         pass
                     # 如果需要等待时间太长，直接跳过重试
                     if wait_seconds > 300:
+                        break
+                    # 限制连续 FloodWait 等待次数，避免该分支永不递增
+                    # attempt 导致 retry_max=0 时无限循环卡住
+                    flood_retry += 1
+                    if flood_retry > max_flood_retry:
                         break
                     await asyncio.sleep(wait_seconds)
                 else:

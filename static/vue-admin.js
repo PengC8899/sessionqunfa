@@ -237,6 +237,7 @@ createApp({
       account_not_authorized: "账号未授权",
       no_authorized_accounts: "当前没有已授权账号",
       no_accounts_available: "当前没有可用账号",
+      no_sendable_groups_for_accounts: "当前账号都没有可发群",
       task_db_unavailable: "任务数据库暂时不可用",
       chat_write_forbidden: "群内禁止发言",
       user_banned_in_channel: "账号在群组中被禁言",
@@ -1502,8 +1503,15 @@ createApp({
           }),
         });
         const strategyText = data.strategy === "distributed_join_only" ? "按最近分配加入结果" : "全群广播";
-        sendResult.value = `批量任务已创建：${data.tasks?.length || data.accounts_count || 0} 个账号任务，模式：${strategyText}`;
-        setNotice("success", `批量任务已创建：${data.tasks?.length || data.accounts_count || 0} 个账号任务，模式：${strategyText}`);
+        const createdCount = data.tasks?.length || data.accounts_count || 0;
+        const skippedNoSendable = Array.isArray(data.skipped_no_sendable_accounts) ? data.skipped_no_sendable_accounts.length : 0;
+        const skippedUnauthorized = Array.isArray(data.skipped_unauthorized_accounts) ? data.skipped_unauthorized_accounts.length : 0;
+        const skippedParts = [];
+        if (skippedNoSendable) skippedParts.push(`无可发群 ${skippedNoSendable} 个`);
+        if (skippedUnauthorized) skippedParts.push(`未授权 ${skippedUnauthorized} 个`);
+        const skippedText = skippedParts.length ? `，已跳过 ${skippedParts.join("，")}` : "";
+        sendResult.value = `批量任务已创建：${createdCount} 个账号任务，模式：${strategyText}${skippedText}`;
+        setNotice("success", `批量任务已创建：${createdCount} 个账号任务，模式：${strategyText}${skippedText}`);
         await fetchTasksSummary(true);
       } catch (error) {
         sendResult.value = `批量发送失败: ${error.message}`;
